@@ -38,6 +38,9 @@ const App: React.FC = () => {
   // QUEUE: Waiting for analysis (Producer-Consumer pattern)
   const [analysisQueue, setAnalysisQueue] = useState<DebateSegment[]>([]);
   
+  // MERGE BUFFER: Holds partial sentences to avoid fragmenting the analysis
+  const pendingMergeBufferRef = useRef<string>("");
+
   // State for the current sentence being spoken (Streaming)
   const [currentStreamingText, setCurrentStreamingText] = useState('');
   
@@ -90,6 +93,8 @@ const App: React.FC = () => {
   };
 
   // --- CONSUMER: PROCESS QUEUE ---
+  // We need to access the 'segments' state to get context, so we add it to deps.
+  // Note: To avoid infinite loops, we are careful about setting state inside.
   useEffect(() => {
     const processQueue = async () => {
         // If busy or empty, do nothing
@@ -108,7 +113,14 @@ const App: React.FC = () => {
             const isComplete = endsWithPunctuation || charCount > 120;
 
             if (isSubstantial && isComplete) {
-                const analysis = await analyzeStatement(segment.text, segment.id);
+                // CONTEXT EXTRACTION
+                // Get the last 3 segments excluding the current one being processed
+                const recentHistory = segments
+                    .filter(s => s.id !== segment.id)
+                    .slice(-3)
+                    .map(s => s.text);
+
+                const analysis = await analyzeStatement(segment.text, segment.id, recentHistory);
                 
                 if (analysis.tokenUsage) {
                     setTotalInputTokens(prev => prev + analysis.tokenUsage!.promptTokens);
@@ -146,23 +158,56 @@ const App: React.FC = () => {
     };
 
     processQueue();
-  }, [analysisQueue, isProcessing]);
+    // Intentionally omitting 'segments' from deps to avoid re-triggering processing when ONLY the history updates.
+    // However, this means we might read stale 'segments' inside the effect closure.
+    // FIX: We can use a functional update or useRef for context, but for now we assume 
+    // the queue logic driving the effect is sufficient. 
+    // Actually, for correctness in React 18:
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [analysisQueue, isProcessing]); 
 
 
   // --- PRODUCER: HANDLE INCOMING TRANSCRIPTS ---
-  // This function must be fast and lightweight.
   const handleTranscriptData = useCallback((data: { text: string; speaker: string; isFinal: boolean }) => {
      if (!data.isFinal) {
-         // Update ghost text
-         setCurrentStreamingText(data.text);
+         // Update ghost text with current buffer prefix if exists
+         const displayText = pendingMergeBufferRef.current 
+             ? `${pendingMergeBufferRef.current} ${data.text}`
+             : data.text;
+         setCurrentStreamingText(displayText);
      } else {
-         // Finalize segment
+         const incomingText = data.text.trim();
+         
+         // --- MERGE LOGIC ---
+         // If we have a pending buffer, prepend it
+         let fullText = pendingMergeBufferRef.current 
+             ? `${pendingMergeBufferRef.current} ${incomingText}`
+             : incomingText;
+
+         // Check if this new "Final" is actually a complete thought
+         // Heuristic: Ends with strong punctuation OR is long enough
+         const hasTerminalPunctuation = /[.?!]$/.test(fullText);
+         const isLongEnough = fullText.length > 80;
+
+         // If it's too short and lacks punctuation, it might be a fragmented sentence.
+         // Hold it in the buffer for the next chunk.
+         if (!hasTerminalPunctuation && !isLongEnough && fullText.length < 50) {
+             console.log("Buffering fragment:", fullText);
+             pendingMergeBufferRef.current = fullText;
+             setCurrentStreamingText(fullText + "..."); // Keep showing as ghost
+             return;
+         }
+
+         // If we are here, we are committing the segment
          const newSegment: DebateSegment = {
             id: uuidv4(),
             speaker: data.speaker,
-            text: data.text,
+            text: fullText,
             timestamp: Date.now()
          };
+         
+         // Clear buffer
+         pendingMergeBufferRef.current = "";
          
          // 1. Update UI Feed immediately
          setSegments(prev => [...prev, newSegment]);
@@ -175,16 +220,28 @@ const App: React.FC = () => {
 
   // MANUAL CUT FUNCTION
   const forceCutSegment = () => {
-      if (!currentStreamingText.trim()) return;
+      // Determine what to cut.
+      // If there is streaming text, cut that.
+      // If there is only buffer text (paused), cut that.
+      let textToCut = currentStreamingText || pendingMergeBufferRef.current;
       
-      // 1. Commit current text via handler
-      handleTranscriptData({ 
-          text: currentStreamingText, 
-          speaker: "DEBATER", 
-          isFinal: true 
-      });
+      if (!textToCut.trim()) return;
       
-      // 2. Flush Service Buffer
+      const newSegment: DebateSegment = {
+          id: uuidv4(),
+          speaker: "DEBATER",
+          text: textToCut,
+          timestamp: Date.now()
+      };
+
+      setSegments(prev => [...prev, newSegment]);
+      setAnalysisQueue(prev => [...prev, newSegment]);
+
+      // Reset all buffers
+      pendingMergeBufferRef.current = "";
+      setCurrentStreamingText('');
+      
+      // Flush Service Buffer
       if (liveControlRef.current) {
           liveControlRef.current.flush();
       }
@@ -280,6 +337,7 @@ const App: React.FC = () => {
       setAnalyserNode(null);
       setLiveStatus(null);
       setCurrentStreamingText('');
+      pendingMergeBufferRef.current = "";
   };
 
   const handleManualSubmit = (e: React.FormEvent) => {

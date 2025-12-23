@@ -11,13 +11,16 @@ export type LiveStatus = {
   message: string;
 };
 
-// --- GARBAGE COLLECTION & CLEANING UTILS ---
+// --- UTILS ---
 
 const isGarbage = (text: string): boolean => {
   const t = text.trim();
   if (t.length === 0) return true;
 
-  // 1. Strict Short Word Filter
+  // Structural noise filter only. 
+  // We strictly rely on the model's System Instruction to avoid semantic hallucinations (credits, subtitles).
+  
+  // 1. Single/Double character noise (unless whitelisted)
   const allowList = [
       'a', 'e', 'é', 'o', 'ó', 'u', 'à', 'y', 
       'oi', 'ai', 'ui', 'eu', 'tu', 'ele', 'nós', 'vós', 
@@ -28,34 +31,10 @@ const isGarbage = (text: string): boolean => {
   
   if (t.length <= 2 && !allowList.includes(t.toLowerCase()) && !/^\d+$/.test(t)) return true;
 
-  const lower = t.toLowerCase();
+  // 2. Pattern Matching for Garbage (Repeated chars or symbols)
+  if (/^[^a-zA-Z0-9À-ÿ\s]+$/.test(t)) return true; // Only symbols
+  if (/^([a-zà-ÿ])(\s+\1){2,}$/i.test(t)) return true; // "a a a a"
   
-  // 2. Enhanced Hallucination List
-  const hallucinations = [
-    'legendas', 'subtitles', 'watching', 'transcribed', 
-    'copyright', 'todos os direitos', 'obrigado por assistir',
-    'subs by', '[music]', '[applause]', '(risos)', '(silêncio)',
-    'www.', '.com', 'http',
-    'inscreva-se', 'deixe o like', 'deixe seu like', 'ative o sininho',
-    'link na bio', 'siga nas redes', 'compartilhe',
-    'tradução por', 'sincronia', 'legenda por', 'editado por',
-    'créditos:', 'fim da transmissão', 'voltamos já', 
-    'a seguir', 'blá blá', 'etc etc', 'realização', 'apoio cultural',
-    'áudio original', 'encerrando transmissão', 'sem áudio',
-    'o se amo', 'um saúde', 'uma saúde', 'obrigado a todos', 'até a próxima',
-    'tv câmara', 'tv senado', 'reprodução', 
-    'legendado por', 'tradução:', 'legenda:',
-    'assine o canal', 'curta o vídeo',
-    'whatsapp', 'facebook', 'instagram', 'twitter', 'youtube'
-  ];
-  
-  if (hallucinations.some(h => lower.includes(h))) return true;
-  
-  // 3. Pattern Matching for Garbage
-  if (/^[^a-zA-Z0-9À-ÿ\s]+$/.test(t)) return true;
-  if (/^([a-zà-ÿ])(\s+\1){2,}$/i.test(t)) return true;
-  if (/^(\w{2,})\s\1\s\1/.test(lower)) return true;
-
   return false;
 };
 
@@ -63,7 +42,7 @@ const cleanTranscriptText = (text: string): string => {
   if (!text) return "";
   let cleaned = text;
   cleaned = cleaned.replace(/\s+/g, ' ');
-  cleaned = cleaned.replace(/\b(\w+)( \1){2,}\b/gi, '$1');
+  cleaned = cleaned.replace(/\b(\w+)( \1){2,}\b/gi, '$1'); // Remove stutter
   return cleaned;
 };
 
@@ -71,7 +50,8 @@ const cleanTranscriptText = (text: string): string => {
 
 export const analyzeStatement = async (
   text: string,
-  segmentId: string
+  segmentId: string,
+  contextHistory: string[] = [] // New: History of previous sentences
 ): Promise<AnalysisResult> => {
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
   
@@ -80,24 +60,39 @@ export const analyzeStatement = async (
     const formattedDate = now.toLocaleDateString('pt-BR', { dateStyle: 'full' });
     const formattedTime = now.toLocaleTimeString('pt-BR');
 
-    const prompt = `
-      CONTEXT: Today is ${formattedDate}, ${formattedTime}.
-      The user is monitoring a live political debate in Brazil.
-      
-      Statement to Analyze: "${text}"
+    // CONTEXT INJECTION
+    const contextBlock = contextHistory.length > 0 
+      ? `IMMEDIATE CONTEXT (Previous statements):\n${contextHistory.map((s, i) => `-${i+1}: "${s}"`).join('\n')}`
+      : "IMMEDIATE CONTEXT: None (Start of debate)";
 
-      INSTRUCTIONS:
-      1. Check this statement for factual accuracy using Google Search.
-      2. Identify: Lies, Distortions, Correct Data, Fallacies.
-      3. If the statement is an opinion, mark as OPINION.
+    const prompt = `
+      SYSTEM_TIME: ${formattedDate}, ${formattedTime}.
+      TASK: Real-time Fact Checking of Brazilian Political Debate.
+
+      ${contextBlock}
+
+      TARGET STATEMENT TO ANALYZE: "${text}"
+
+      EXECUTION PROTOCOL:
+      1. CLASSIFICATION: Determine if "TARGET STATEMENT" contains a Checkable Factual Claim (stats, laws, specific past events, quotes) OR if it is Pure Opinion/Rhetoric.
+         - If OPINION/RHETORIC: Return verdict "OPINION" immediately. DO NOT use Google Search.
+         - If FACTUAL CLAIM: You MUST use the 'googleSearch' tool to verify the specific data points.
       
-      Return JSON:
-      - verdict: "TRUE", "FALSE", "MISLEADING", "UNVERIFIABLE", "OPINION"
-      - confidence: number (0-100)
-      - explanation: Concise Portuguese summary (Max 2 sentences).
-      - counterEvidence: If FALSE/MISLEADING, provide real data.
-      - sentimentScore: -1 (Hostile) to 1 (Constructive).
-      - logicalFallacies: [{name, description}] (in PT-BR).
+      2. CONTEXTUALIZATION: Use the "IMMEDIATE CONTEXT" to resolve pronouns (he/she/it) or references to previous topics.
+      
+      3. ANALYSIS:
+         - Identify lies, distortions, or cherry-picking.
+         - Identify logical fallacies (Ad Hominem, Strawman, etc).
+      
+      RETURN JSON FORMAT (pt-BR):
+      {
+        "verdict": "TRUE" | "FALSE" | "MISLEADING" | "UNVERIFIABLE" | "OPINION",
+        "confidence": number (0-100),
+        "explanation": "Concise summary in Portuguese (Max 250 chars).",
+        "counterEvidence": "If FALSE/MISLEADING, provide the correct data with source.",
+        "sentimentScore": number (-1.0 to 1.0),
+        "logicalFallacies": [{"name": "Name", "description": "Short desc"}]
+      }
     `;
 
     const response = await ai.models.generateContent({
@@ -148,6 +143,7 @@ export const analyzeStatement = async (
       sources: sources,
       sentimentScore: data.sentimentScore,
       logicalFallacies: data.logicalFallacies || [],
+      context: contextHistory
     };
   } catch (error) {
     console.error("Gemini Analysis Error:", error);
@@ -155,7 +151,7 @@ export const analyzeStatement = async (
       segmentId,
       verdict: VerdictType.UNVERIFIABLE,
       confidence: 0,
-      explanation: "Erro de verificação.",
+      explanation: "Erro de processamento ou verificação.",
       sources: [],
       sentimentScore: 0,
     };
@@ -175,9 +171,6 @@ const calculateRMS = (data: Float32Array): number => {
     return Math.sqrt(sum / data.length);
 };
 
-/**
- * Connects to Gemini Live API to stream audio from a tab/system for transcription.
- */
 export const connectToLiveDebate = async (
   stream: MediaStream,
   onTranscript: (data: { text: string; speaker: string; isFinal: boolean }) => void,
@@ -185,9 +178,6 @@ export const connectToLiveDebate = async (
   onStatus?: (status: LiveStatus) => void
 ): Promise<LiveConnectionController> => {
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-  
-  // NOTE: Removed stream.clone() to avoid browser inconsistencies with track states in production.
-  // Using the original stream source. 
   
   const audioContext = new AudioContext({ sampleRate: 16000 });
   if (audioContext.state === 'suspended') {
@@ -203,14 +193,10 @@ export const connectToLiveDebate = async (
   let silenceTimer: any = null;
   let activeSession: any = null;
   
-  // PRODUCTION FIX: Lowered VAD Threshold significantly. 
-  // 0.01 was too high for some microphones, leading to silence.
+  // VAD Settings
   const VAD_THRESHOLD = 0.002; 
-  
-  const SILENCE_HANGOVER_CHUNKS = 5; // Increased hangover for safety
+  const SILENCE_HANGOVER_CHUNKS = 5; 
   let silenceChunkCount = 0;
-
-  // Backpressure monitoring
   let pendingAudioRequests = 0;
   const MAX_PENDING_REQUESTS = 4; 
 
@@ -244,15 +230,20 @@ export const connectToLiveDebate = async (
           voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
         },
         inputAudioTranscription: {}, 
+        // ENHANCED SYSTEM INSTRUCTION FOR ROBUSTNESS
         systemInstruction: `
-          Role: Portuguese (Brazil) Transcriber.
-          Context: Live political debate.
+          Role: Expert Court Reporter / Stenographer for Portuguese (Brazil).
+          Context: High-stakes political debate feed.
           
-          Directives:
-          1. TRANSCRIBE EXACTLY what is said in Portuguese.
-          2. IGNORE non-speech noise (applause, music, static).
-          3. DO NOT output metadata like "Obrigado por assistir" or "Legendas".
-          4. If audio is unclear, output nothing.
+          CRITICAL RULES:
+          1. AUDIO-ONLY: Transcribe ONLY spoken words.
+          2. ANTI-HALLUCINATION: 
+             - NEVER output "Obrigado por assistir".
+             - NEVER output "Legendas por...".
+             - NEVER output "Copyright".
+             - If the audio is music, silence, or unintelligible noise, OUTPUT NOTHING (Empty String).
+          3. VERBATIM: Do not summarize. Capture the exact Portuguese phrasing.
+          4. CONTINUITY: If a sentence is interrupted, transcribe the partial sentence exactly.
         `,
       },
       callbacks: {
@@ -262,11 +253,9 @@ export const connectToLiveDebate = async (
            onStatus?.({ type: 'info', message: "LIVE FEED ACTIVE" });
         },
         onmessage: (msg: LiveServerMessage) => {
-           // 1. Handle Input Transcription
            const inputTrx = msg.serverContent?.inputTranscription;
            if (inputTrx?.text) {
                let text = inputTrx.text;
-               // console.log("Raw transcript:", text); // Debug log
                
                if (isGarbage(text)) {
                    return; 
@@ -285,17 +274,11 @@ export const connectToLiveDebate = async (
                }
            }
            
-           // 2. Handle Turn Complete
            if (msg.serverContent?.turnComplete) {
                const trimmed = currentVolatileBuffer.trim();
-               const isStrongPunctuation = /[.?!]$/.test(trimmed);
-               const isSubstantial = trimmed.length > 80;
-               const isCompleteSentence = trimmed.length > 30 && isStrongPunctuation;
-               
-               if (isSubstantial || isCompleteSentence) {
+               // More lenient check for commit to ensure we don't hold text too long
+               if (trimmed.length > 0) {
                    commitBuffer();
-               } else {
-                   scheduleSilenceCommit();
                }
            }
         },
@@ -317,21 +300,14 @@ export const connectToLiveDebate = async (
     processor.onaudioprocess = async (e) => {
       if (!isConnected || !activeSession) return; 
 
-      // PRODUCTION FIX: Removed rigid backpressure blocking.
-      // If requests pile up, we log a warning but keep trying to send latest audio to avoid "freezing".
       if (pendingAudioRequests >= MAX_PENDING_REQUESTS) {
           console.warn("High Latency: Audio queue full, dropping frames may occur.");
-          // We intentionally do NOT return here, effectively overwriting/pushing through 
-          // to ensure the socket doesn't stall completely, or rely on socket internal buffering.
-          // However, to prevent memory leaks in the JS heap, we should be careful. 
-          // Let's drop if it gets REALLY bad (e.g. > 10).
           if (pendingAudioRequests > 10) return;
       }
 
       const inputData = e.inputBuffer.getChannelData(0);
       const rms = calculateRMS(inputData);
       
-      // VAD CHECK
       if (rms < VAD_THRESHOLD) {
           silenceChunkCount++;
           if (silenceChunkCount > SILENCE_HANGOVER_CHUNKS) {

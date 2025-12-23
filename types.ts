@@ -40,6 +40,7 @@ export interface AnalysisResult {
   sentimentScore: number; // -1 to 1
   logicalFallacies?: LogicalFallacy[];
   tokenUsage?: TokenUsage;
+  context?: string[]; // New: The historical context used for this analysis
 }
 
 export interface AppState {
