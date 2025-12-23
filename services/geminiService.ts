@@ -47,7 +47,10 @@ export const analyzeStatement = async (
   segmentId: string,
   contextHistory: string[] = [] 
 ): Promise<AnalysisResult> => {
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+  const apiKey = process.env.API_KEY;
+  if (!apiKey) throw new Error("API_KEY not found");
+
+  const ai = new GoogleGenAI({ apiKey });
   
   try {
     const now = new Date();
@@ -180,7 +183,13 @@ export const connectToLiveDebate = async (
   onError: (err: Error) => void,
   onStatus?: (status: LiveStatus) => void
 ): Promise<LiveConnectionController> => {
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+  const apiKey = process.env.API_KEY;
+  if (!apiKey) {
+      onError(new Error("API_KEY not configured"));
+      return { disconnect: async () => {}, flush: () => {} };
+  }
+
+  const ai = new GoogleGenAI({ apiKey });
   
   const audioContext = new AudioContext({ sampleRate: 16000 });
   if (audioContext.state === 'suspended') {
@@ -233,24 +242,11 @@ export const connectToLiveDebate = async (
         speechConfig: {
           voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
         },
-        // [CRITICAL] Explicitly enabling transcription with the correct model
-        inputAudioTranscription: {
-            model: LIVE_MODEL_NAME 
-        }, 
-        systemInstruction: {
-            parts: [{
-                text: `
-                Role: Portuguese (Brazil) Transcriber.
-                Context: Political debate.
-                
-                Rules:
-                1. Transcribe spoken Portuguese exactly.
-                2. IGNORE background noise, music, or silence.
-                3. DO NOT output "Obrigado por assistir", "Legendas", or credits.
-                4. If speech is unclear, output nothing.
-                `
-            }]
-        }
+        // [CRITICAL] Explicitly enabling transcription. 
+        // Using an empty object {} allows the model to use default transcription settings.
+        // Specifying a model name here often causes connection closure if incorrect.
+        inputAudioTranscription: {}, 
+        systemInstruction: "Role: Portuguese (Brazil) Transcriber. Context: Political debate. Rules: Transcribe spoken Portuguese exactly. IGNORE background noise. DO NOT output credits."
       },
       callbacks: {
         onopen: () => {
@@ -287,8 +283,8 @@ export const connectToLiveDebate = async (
                }
            }
         },
-        onclose: () => {
-           console.log("🔴 Gemini Live Closed");
+        onclose: (e: any) => {
+           console.log("🔴 Gemini Live Closed", e);
            onStatus?.({ type: 'warning', message: "CONNECTION CLOSED" });
            isConnected = false;
         },
@@ -326,9 +322,13 @@ export const connectToLiveDebate = async (
       // Send to API
       try {
           pendingAudioRequests++;
+          // [FIX] 'sendRealtimeInput' requires a RealtimeInput array.
+          // The content must be wrapped in a 'media' object.
           await activeSession.sendRealtimeInput([{ 
-              mimeType: 'audio/pcm;rate=16000',
-              data: pcmData
+              media: {
+                  mimeType: 'audio/pcm;rate=16000',
+                  data: pcmData
+              }
           }]);
       } catch (e) {
           console.error("Audio send error", e);
