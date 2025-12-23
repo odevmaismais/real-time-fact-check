@@ -1,4 +1,4 @@
-import { GoogleGenAI, Type, LiveServerMessage, Modality } from "@google/genai";
+import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
 import { AnalysisResult, VerdictType } from "../types";
 
 // [CRITICAL] Using the specific model requested that supports Live API reliably
@@ -15,7 +15,6 @@ export type LiveStatus = {
 const isGarbage = (text: string): boolean => {
   const t = text.trim();
   if (t.length === 0) return true;
-
   // Structural noise filter
   const allowList = [
       'a', 'e', 'é', 'o', 'ó', 'u', 'à', 'y', 
@@ -24,10 +23,7 @@ const isGarbage = (text: string): boolean => {
       'sim', 'não', 'ok', 'fim', 'paz', 'luz', 'sol', 'mar',
       'fé', 'lei', 'crê', 'dê', 'vê'
   ];
-  
   if (t.length <= 2 && !allowList.includes(t.toLowerCase()) && !/^\d+$/.test(t)) return true;
-  if (/^[^a-zA-Z0-9À-ÿ\s]+$/.test(t)) return true; 
-
   return false;
 };
 
@@ -40,30 +36,6 @@ const cleanTranscriptText = (text: string): string => {
   return cleaned;
 };
 
-// --- AUDIO PROCESSING ---
-
-// Convert Float32 (Web Audio) to Int16 (PCM) 1:1 without downsampling
-// This preserves the native sample rate quality
-const floatTo16BitPCM = (input: Float32Array): Int16Array => {
-    const output = new Int16Array(input.length);
-    for (let i = 0; i < input.length; i++) {
-        const s = Math.max(-1, Math.min(1, input[i]));
-        output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-    }
-    return output;
-};
-
-// [FIX] TS2345: Accept ArrayBufferLike to support SharedArrayBuffer if needed
-function arrayBufferToBase64(buffer: ArrayBufferLike) {
-  let binary = '';
-  const bytes = new Uint8Array(buffer);
-  const len = bytes.byteLength;
-  for (let i = 0; i < len; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return window.btoa(binary);
-}
-
 // -------------------------------------------
 
 export const analyzeStatement = async (
@@ -71,10 +43,7 @@ export const analyzeStatement = async (
   segmentId: string,
   contextHistory: string[] = [] 
 ): Promise<AnalysisResult> => {
-  const apiKey = process.env.API_KEY;
-  if (!apiKey) throw new Error("API_KEY not found");
-
-  const ai = new GoogleGenAI({ apiKey });
+  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
   
   try {
     const now = new Date();
@@ -88,22 +57,13 @@ export const analyzeStatement = async (
     const prompt = `
       SYSTEM_TIME: ${formattedDate}, ${formattedTime}.
       TASK: Real-time Fact Checking of Brazilian Political Debate.
-
       ${contextBlock}
-
       TARGET STATEMENT TO ANALYZE: "${text}"
-
       EXECUTION PROTOCOL:
-      1. CLASSIFICATION: Determine if "TARGET STATEMENT" contains a Checkable Factual Claim (stats, laws, specific past events, quotes) OR if it is Pure Opinion/Rhetoric.
+      1. CLASSIFICATION: Determine if "TARGET STATEMENT" contains a Checkable Factual Claim.
          - If OPINION/RHETORIC: Return verdict "OPINION" immediately. DO NOT use Google Search.
-         - If FACTUAL CLAIM: You MUST use the 'googleSearch' tool to verify the specific data points.
-      
-      2. CONTEXTUALIZATION: Use the "IMMEDIATE CONTEXT" to resolve pronouns (he/she/it) or references to previous topics.
-      
-      3. ANALYSIS:
-         - Identify lies, distortions, or cherry-picking.
-         - Identify logical fallacies (Ad Hominem, Strawman, etc).
-      
+         - If FACTUAL CLAIM: You MUST use the 'googleSearch' tool.
+      2. CONTEXTUALIZATION: Use the "IMMEDIATE CONTEXT" to resolve pronouns.
       RETURN JSON FORMAT (pt-BR).
     `;
 
@@ -113,34 +73,11 @@ export const analyzeStatement = async (
       config: {
         tools: [{ googleSearch: {} }],
         responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            verdict: { type: Type.STRING, enum: Object.values(VerdictType) },
-            confidence: { type: Type.NUMBER },
-            explanation: { type: Type.STRING },
-            counterEvidence: { type: Type.STRING },
-            sentimentScore: { type: Type.NUMBER },
-            logicalFallacies: { 
-              type: Type.ARRAY, 
-              items: { 
-                type: Type.OBJECT,
-                properties: {
-                  name: { type: Type.STRING },
-                  description: { type: Type.STRING }
-                },
-                required: ["name", "description"]
-              } 
-            },
-          },
-          required: ["verdict", "confidence", "explanation", "sentimentScore"],
-        },
       },
     });
 
-    const jsonText = response.text;
+    const jsonText = response.text();
     if (!jsonText) throw new Error("No response from AI");
-
     const data = JSON.parse(jsonText);
     const sources = response.candidates?.[0]?.groundingMetadata?.groundingChunks
       ?.map((chunk: any) => chunk.web)
@@ -163,7 +100,7 @@ export const analyzeStatement = async (
       segmentId,
       verdict: VerdictType.UNVERIFIABLE,
       confidence: 0,
-      explanation: "Erro de processamento ou verificação.",
+      explanation: "Erro de processamento.",
       sources: [],
       sentimentScore: 0,
     };
@@ -177,11 +114,26 @@ export interface LiveConnectionController {
 
 const calculateRMS = (data: Float32Array): number => {
     let sum = 0;
-    for (let i = 0; i < data.length; i++) {
-        sum += data[i] * data[i];
-    }
+    for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
     return Math.sqrt(sum / data.length);
 };
+
+// Optimized Base64 conversion
+function floatTo16BitPCM(input: Float32Array): string {
+    const output = new Int16Array(input.length);
+    for (let i = 0; i < input.length; i++) {
+        const s = Math.max(-1, Math.min(1, input[i]));
+        output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+    const bytes = new Uint8Array(output.buffer);
+    let binary = '';
+    const len = bytes.byteLength;
+    const CHUNK_SIZE = 0x8000; 
+    for (let i = 0; i < len; i += CHUNK_SIZE) {
+        binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK_SIZE)));
+    }
+    return btoa(binary);
+}
 
 export const connectToLiveDebate = async (
   stream: MediaStream,
@@ -189,20 +141,10 @@ export const connectToLiveDebate = async (
   onError: (err: Error) => void,
   onStatus?: (status: LiveStatus) => void
 ): Promise<LiveConnectionController> => {
-  const apiKey = process.env.API_KEY;
-  if (!apiKey) {
-      onError(new Error("API_KEY not configured"));
-      return { disconnect: async () => {}, flush: () => {} };
-  }
-
-  const ai = new GoogleGenAI({ apiKey });
+  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
   
-  // [CRITICAL] 1. Use Native AudioContext without forcing sampleRate
-  // This allows the browser to use 44.1kHz or 48kHz depending on hardware, preventing Code 1000.
+  // [FIX 1] Removed fixed sampleRate. Let browser decide (likely 48000Hz for Youtube)
   const audioContext = new AudioContext(); 
-  const currentSampleRate = audioContext.sampleRate;
-  console.log("Audio Context Rate:", currentSampleRate);
-
   if (audioContext.state === 'suspended') {
     await audioContext.resume();
   }
@@ -211,25 +153,17 @@ export const connectToLiveDebate = async (
   const processor = audioContext.createScriptProcessor(4096, 1, 1);
   
   let currentVolatileBuffer = "";
-  const DEFAULT_SPEAKER = "DEBATER"; 
   let isConnected = false;
   let silenceTimer: any = null;
   let activeSession: any = null;
   
   const VAD_THRESHOLD = 0.001; 
-  const SILENCE_HANGOVER_CHUNKS = 5; 
   let silenceChunkCount = 0;
-  
   let pendingAudioRequests = 0;
-  const MAX_PENDING_REQUESTS = 10; 
 
   const commitBuffer = () => {
     if (currentVolatileBuffer.trim().length > 0) {
-        try {
-            onTranscript({ text: currentVolatileBuffer.trim(), speaker: DEFAULT_SPEAKER, isFinal: true });
-        } catch (e) {
-            console.error("Callback error", e);
-        }
+        onTranscript({ text: currentVolatileBuffer.trim(), speaker: "DEBATE", isFinal: true });
         currentVolatileBuffer = "";
     }
   };
@@ -237,65 +171,58 @@ export const connectToLiveDebate = async (
   const scheduleSilenceCommit = () => {
       if (silenceTimer) clearTimeout(silenceTimer);
       silenceTimer = setTimeout(() => {
-          if (currentVolatileBuffer.trim().length > 0) {
-             commitBuffer();
-          }
+          if (currentVolatileBuffer.trim().length > 0) commitBuffer();
       }, 1500); 
   };
 
   try {
+    console.log("🎤 Audio Context Rate:", audioContext.sampleRate); // Debug
+
     activeSession = await ai.live.connect({
       model: LIVE_MODEL_NAME,
       config: {
-        // [CRITICAL] 2. Set Modality to TEXT and enable inputAudioTranscription
+        // [FIX 2] Request TEXT only. No AUDIO response.
         responseModalities: [Modality.TEXT], 
-        
-        // [FIX] Explicitly enable transcription with an empty object as per Gemini 2.0 Live docs
+        speechConfig: {
+          voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
+        },
+        // [FIX 3] Empty object enables transcription without invalid 'model' field
+        // @ts-ignore
         inputAudioTranscription: {}, 
-
-        systemInstruction: "You are a live transcriber. Your job is to listen to the audio stream and output the Portuguese text EXACTLY as spoken. Do not summarize. Do not answer. Just write down the words immediately. If there is silence, output nothing."
+        systemInstruction: {
+            parts: [{
+                text: "Transcreva o debate político em Português (Brasil) EXATAMENTE como falado. Ignore ruídos."
+            }]
+        }
       },
       callbacks: {
         onopen: () => {
-           console.log("🟢 Gemini Live Connected (" + LIVE_MODEL_NAME + ") Rate: " + currentSampleRate);
+           console.log("🟢 Gemini Live Connected");
            isConnected = true;
-           onStatus?.({ type: 'info', message: "LIVE LINK ESTABLISHED" });
+           onStatus?.({ type: 'info', message: "CONECTADO AO YOUTUBE" });
         },
         onmessage: (msg: LiveServerMessage) => {
-           // We look for text in the model's turn (since the model is acting as the transcriber via prompt)
-           const textParts = msg.serverContent?.modelTurn?.parts;
-           if (textParts) {
-               for (const part of textParts) {
-                   if (part.text) {
-                       let text = part.text;
-                       if (isGarbage(text)) continue;
-                       
-                       text = cleanTranscriptText(text);
-                       currentVolatileBuffer += text;
-
-                       try {
-                           onTranscript({ text: currentVolatileBuffer, speaker: DEFAULT_SPEAKER, isFinal: false });
-                       } catch (e) { }
-                       
-                       scheduleSilenceCommit();
-                   }
+           const inputTrx = msg.serverContent?.inputTranscription;
+           if (inputTrx?.text) {
+               let text = cleanTranscriptText(inputTrx.text);
+               if (!isGarbage(text)) {
+                   currentVolatileBuffer += text;
+                   onTranscript({ text: currentVolatileBuffer, speaker: "DEBATE", isFinal: false });
+                   scheduleSilenceCommit();
                }
            }
-
            if (msg.serverContent?.turnComplete) {
-               if (currentVolatileBuffer.trim().length > 0) {
-                   commitBuffer();
-               }
+               commitBuffer();
            }
         },
-        onclose: (e: any) => {
+        onclose: (e) => {
            console.log("🔴 Gemini Live Closed", e);
-           onStatus?.({ type: 'warning', message: "CONNECTION CLOSED" });
+           onStatus?.({ type: 'warning', message: "DESCONECTADO" });
            isConnected = false;
         },
         onerror: (err: any) => {
            console.error("🔴 Gemini Live Error:", err);
-           onStatus?.({ type: 'error', message: "STREAM ERROR" });
+           onStatus?.({ type: 'error', message: "ERRO DE STREAM" });
         }
       }
     });
@@ -305,32 +232,27 @@ export const connectToLiveDebate = async (
     processor.onaudioprocess = async (e) => {
       if (!isConnected || !activeSession) return; 
 
-      if (pendingAudioRequests >= MAX_PENDING_REQUESTS) return;
+      if (pendingAudioRequests >= 10) return;
 
       const inputData = e.inputBuffer.getChannelData(0);
-      
-      // VAD
       const rms = calculateRMS(inputData);
+      
+      // Simples VAD
       if (rms < VAD_THRESHOLD) {
           silenceChunkCount++;
-          if (silenceChunkCount > SILENCE_HANGOVER_CHUNKS) return; 
+          if (silenceChunkCount > 5) return; 
       } else {
           silenceChunkCount = 0;
       }
 
-      // [CRITICAL] 3. Native Sample Rate Processing
-      // Convert Float32 to Int16 directly (1:1 mapping, no downsampling)
       const pcmData = floatTo16BitPCM(inputData);
-      const base64Data = arrayBufferToBase64(pcmData.buffer);
       
       try {
           pendingAudioRequests++;
+          // [FIX 4] Dynamic Sample Rate sending
           await activeSession.sendRealtimeInput([{ 
-              media: {
-                  // [CRITICAL] Dynamic Sample Rate in MimeType matches AudioContext
-                  mimeType: `audio/pcm;rate=${currentSampleRate}`,
-                  data: base64Data
-              }
+              mimeType: `audio/pcm;rate=${audioContext.sampleRate}`,
+              data: pcmData
           }]);
       } catch (e) {
           console.error("Audio send error", e);
@@ -345,23 +267,17 @@ export const connectToLiveDebate = async (
     return {
        disconnect: async () => {
            isConnected = false;
-           if (silenceTimer) clearTimeout(silenceTimer);
-           
            source.disconnect();
            processor.disconnect();
-           processor.onaudioprocess = null;
-           
-           if (audioContext.state !== 'closed') await audioContext.close();
            if (activeSession) activeSession.close();
+           if (audioContext.state !== 'closed') await audioContext.close();
        },
        flush: () => {
            currentVolatileBuffer = "";
-           if (silenceTimer) clearTimeout(silenceTimer);
        }
     };
   } catch (err: any) {
     onError(err);
-    if (audioContext.state !== 'closed') await audioContext.close();
     return { disconnect: async () => {}, flush: () => {} };
   }
 }
