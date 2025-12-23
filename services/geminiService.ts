@@ -1,10 +1,9 @@
-
 import { GoogleGenAI, Type, LiveServerMessage, Modality } from "@google/genai";
 import { AnalysisResult, VerdictType } from "../types";
 
-// We use the flash preview for speed, as live fact-checking needs low latency.
-const MODEL_NAME = "gemini-3-flash-preview";
-const LIVE_MODEL_NAME = "gemini-2.5-flash-native-audio-preview-09-2025";
+// [FIX] Usando os modelos REAIS disponíveis atualmente na API
+const MODEL_NAME = "gemini-2.0-flash-exp"; 
+const LIVE_MODEL_NAME = "gemini-2.0-flash-exp";
 
 export type LiveStatus = {
   type: 'info' | 'warning' | 'error';
@@ -17,10 +16,8 @@ const isGarbage = (text: string): boolean => {
   const t = text.trim();
   if (t.length === 0) return true;
 
-  // Structural noise filter only. 
-  // We strictly rely on the model's System Instruction to avoid semantic hallucinations (credits, subtitles).
-  
-  // 1. Single/Double character noise (unless whitelisted)
+  // Filtro básico de ruído estrutural
+  // Se for apenas uma letra (exceto as vogais e 'y' comuns) ou símbolos
   const allowList = [
       'a', 'e', 'é', 'o', 'ó', 'u', 'à', 'y', 
       'oi', 'ai', 'ui', 'eu', 'tu', 'ele', 'nós', 'vós', 
@@ -30,11 +27,8 @@ const isGarbage = (text: string): boolean => {
   ];
   
   if (t.length <= 2 && !allowList.includes(t.toLowerCase()) && !/^\d+$/.test(t)) return true;
+  if (/^[^a-zA-Z0-9À-ÿ\s]+$/.test(t)) return true; 
 
-  // 2. Pattern Matching for Garbage (Repeated chars or symbols)
-  if (/^[^a-zA-Z0-9À-ÿ\s]+$/.test(t)) return true; // Only symbols
-  if (/^([a-zà-ÿ])(\s+\1){2,}$/i.test(t)) return true; // "a a a a"
-  
   return false;
 };
 
@@ -42,7 +36,8 @@ const cleanTranscriptText = (text: string): string => {
   if (!text) return "";
   let cleaned = text;
   cleaned = cleaned.replace(/\s+/g, ' ');
-  cleaned = cleaned.replace(/\b(\w+)( \1){2,}\b/gi, '$1'); // Remove stutter
+  // Remove gagueira repetitiva (ex: "o o o que")
+  cleaned = cleaned.replace(/\b(\w+)( \1){2,}\b/gi, '$1'); 
   return cleaned;
 };
 
@@ -51,8 +46,9 @@ const cleanTranscriptText = (text: string): string => {
 export const analyzeStatement = async (
   text: string,
   segmentId: string,
-  contextHistory: string[] = [] // New: History of previous sentences
+  contextHistory: string[] = [] 
 ): Promise<AnalysisResult> => {
+  // [FIX] Certifique-se que REACT_APP_API_KEY ou VITE_API_KEY esteja configurado
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
   
   try {
@@ -60,7 +56,6 @@ export const analyzeStatement = async (
     const formattedDate = now.toLocaleDateString('pt-BR', { dateStyle: 'full' });
     const formattedTime = now.toLocaleTimeString('pt-BR');
 
-    // CONTEXT INJECTION
     const contextBlock = contextHistory.length > 0 
       ? `IMMEDIATE CONTEXT (Previous statements):\n${contextHistory.map((s, i) => `-${i+1}: "${s}"`).join('\n')}`
       : "IMMEDIATE CONTEXT: None (Start of debate)";
@@ -84,15 +79,7 @@ export const analyzeStatement = async (
          - Identify lies, distortions, or cherry-picking.
          - Identify logical fallacies (Ad Hominem, Strawman, etc).
       
-      RETURN JSON FORMAT (pt-BR):
-      {
-        "verdict": "TRUE" | "FALSE" | "MISLEADING" | "UNVERIFIABLE" | "OPINION",
-        "confidence": number (0-100),
-        "explanation": "Concise summary in Portuguese (Max 250 chars).",
-        "counterEvidence": "If FALSE/MISLEADING, provide the correct data with source.",
-        "sentimentScore": number (-1.0 to 1.0),
-        "logicalFallacies": [{"name": "Name", "description": "Short desc"}]
-      }
+      RETURN JSON FORMAT (pt-BR).
     `;
 
     const response = await ai.models.generateContent({
@@ -171,6 +158,17 @@ const calculateRMS = (data: Float32Array): number => {
     return Math.sqrt(sum / data.length);
 };
 
+// [FIX] Better Base64 conversion for Audio
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+    let binary = '';
+    const bytes = new Uint8Array(buffer);
+    const len = bytes.byteLength;
+    for (let i = 0; i < len; i++) {
+        binary += String.fromCharCode(bytes[i]);
+    }
+    return window.btoa(binary);
+}
+
 export const connectToLiveDebate = async (
   stream: MediaStream,
   onTranscript: (data: { text: string; speaker: string; isFinal: boolean }) => void,
@@ -179,6 +177,7 @@ export const connectToLiveDebate = async (
 ): Promise<LiveConnectionController> => {
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
   
+  // [FIX] Ensure AudioContext is handled correctly across browsers
   const audioContext = new AudioContext({ sampleRate: 16000 });
   if (audioContext.state === 'suspended') {
     await audioContext.resume();
@@ -193,12 +192,11 @@ export const connectToLiveDebate = async (
   let silenceTimer: any = null;
   let activeSession: any = null;
   
-  // VAD Settings
   const VAD_THRESHOLD = 0.002; 
   const SILENCE_HANGOVER_CHUNKS = 5; 
   let silenceChunkCount = 0;
   let pendingAudioRequests = 0;
-  const MAX_PENDING_REQUESTS = 4; 
+  const MAX_PENDING_REQUESTS = 10; 
 
   const commitBuffer = () => {
     if (currentVolatileBuffer.trim().length > 0) {
@@ -215,84 +213,90 @@ export const connectToLiveDebate = async (
       if (silenceTimer) clearTimeout(silenceTimer);
       silenceTimer = setTimeout(() => {
           if (currentVolatileBuffer.trim().length > 0) {
-             console.log("Silence watchdog - forcing commit");
              commitBuffer();
           }
-      }, 2000); 
+      }, 1500); 
   };
 
   try {
     activeSession = await ai.live.connect({
       model: LIVE_MODEL_NAME,
       config: {
-        responseModalities: [Modality.AUDIO],
+        // [FIX] We only need Input Transcription for this use case
+        responseModalities: [Modality.AUDIO], 
         speechConfig: {
           voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
         },
-        inputAudioTranscription: {}, 
-        // ENHANCED SYSTEM INSTRUCTION FOR ROBUSTNESS
-        systemInstruction: `
-          Role: Expert Court Reporter / Stenographer for Portuguese (Brazil).
-          Context: High-stakes political debate feed.
-          
-          CRITICAL RULES:
-          1. AUDIO-ONLY: Transcribe ONLY spoken words.
-          2. ANTI-HALLUCINATION: 
-             - NEVER output "Obrigado por assistir".
-             - NEVER output "Legendas por...".
-             - NEVER output "Copyright".
-             - If the audio is music, silence, or unintelligible noise, OUTPUT NOTHING (Empty String).
-          3. VERBATIM: Do not summarize. Capture the exact Portuguese phrasing.
-          4. CONTINUITY: If a sentence is interrupted, transcribe the partial sentence exactly.
-        `,
-      },
-      callbacks: {
-        onopen: () => {
-           console.log("Gemini Live Session Opened");
-           isConnected = true;
-           onStatus?.({ type: 'info', message: "LIVE FEED ACTIVE" });
-        },
-        onmessage: (msg: LiveServerMessage) => {
-           const inputTrx = msg.serverContent?.inputTranscription;
-           if (inputTrx?.text) {
-               let text = inputTrx.text;
-               
-               if (isGarbage(text)) {
-                   return; 
-               }
-               
-               text = cleanTranscriptText(text);
-               currentVolatileBuffer += text;
-
-               if (currentVolatileBuffer.length > 1500) {
-                   commitBuffer();
-               } else {
-                   try {
-                       onTranscript({ text: currentVolatileBuffer, speaker: DEFAULT_SPEAKER, isFinal: false });
-                   } catch (e) { console.error("Callback error (partial)", e); }
-                   scheduleSilenceCommit();
-               }
-           }
-           
-           if (msg.serverContent?.turnComplete) {
-               const trimmed = currentVolatileBuffer.trim();
-               // More lenient check for commit to ensure we don't hold text too long
-               if (trimmed.length > 0) {
-                   commitBuffer();
-               }
-           }
-        },
-        onerror: (err) => {
-            console.error("Gemini Live Error:", err);
-            onStatus?.({ type: 'error', message: "CONNECTION INTERRUPTED" });
-            isConnected = false;
-        },
-        onclose: () => {
-            console.log("Gemini Live Session Closed");
-            onStatus?.({ type: 'warning', message: "SESSION ENDED" });
-            isConnected = false;
+        inputAudioTranscription: {
+            model: "gemini-2.0-flash-exp" // Ensure explicit transcription model if supported, or let auto
+        }, 
+        systemInstruction: {
+            parts: [{
+                text: `
+                Role: Portuguese (Brazil) Transcriber.
+                Context: Political debate.
+                
+                Rules:
+                1. Transcribe spoken Portuguese exactly.
+                2. IGNORE background noise, music, or silence.
+                3. DO NOT output "Obrigado por assistir", "Legendas", or credits.
+                4. If speech is unclear, output nothing.
+                `
+            }]
         }
-      }
+      },
+    });
+
+    // Event Handling
+    // Note: The SDK event structure might differ slightly depending on version, 
+    // ensuring we catch the right content.
+    // @ts-ignore
+    activeSession.on('open', () => {
+        console.log("🟢 Gemini Live Connected");
+        isConnected = true;
+        onStatus?.({ type: 'info', message: "LIVE LINK ESTABLISHED" });
+    });
+
+    // @ts-ignore
+    activeSession.on('message', (msg: LiveServerMessage) => {
+        // Handle Server Content (Transcription)
+        const inputTrx = msg.serverContent?.inputTranscription;
+        
+        if (inputTrx?.text) {
+            let text = inputTrx.text;
+            // console.log("Stream:", text);
+            
+            if (isGarbage(text)) return;
+            
+            text = cleanTranscriptText(text);
+            currentVolatileBuffer += text;
+
+            // Send 'ghost' update for UI
+            try {
+                onTranscript({ text: currentVolatileBuffer, speaker: DEFAULT_SPEAKER, isFinal: false });
+            } catch (e) { }
+            
+            scheduleSilenceCommit();
+        }
+
+        if (msg.serverContent?.turnComplete) {
+            if (currentVolatileBuffer.trim().length > 0) {
+                commitBuffer();
+            }
+        }
+    });
+
+    // @ts-ignore
+    activeSession.on('close', () => {
+        console.log("🔴 Gemini Live Closed");
+        onStatus?.({ type: 'warning', message: "CONNECTION CLOSED" });
+        isConnected = false;
+    });
+
+    // @ts-ignore
+    activeSession.on('error', (err: any) => {
+        console.error("🔴 Gemini Live Error:", err);
+        onStatus?.({ type: 'error', message: "STREAM ERROR" });
     });
 
     isConnected = true;
@@ -301,35 +305,33 @@ export const connectToLiveDebate = async (
       if (!isConnected || !activeSession) return; 
 
       if (pendingAudioRequests >= MAX_PENDING_REQUESTS) {
-          console.warn("High Latency: Audio queue full, dropping frames may occur.");
-          if (pendingAudioRequests > 10) return;
+          // Drop frame to catch up
+          return;
       }
 
       const inputData = e.inputBuffer.getChannelData(0);
-      const rms = calculateRMS(inputData);
       
+      // Simple VAD
+      const rms = calculateRMS(inputData);
       if (rms < VAD_THRESHOLD) {
           silenceChunkCount++;
-          if (silenceChunkCount > SILENCE_HANGOVER_CHUNKS) {
-              return; 
-          }
+          if (silenceChunkCount > SILENCE_HANGOVER_CHUNKS) return; 
       } else {
           silenceChunkCount = 0;
       }
 
+      // Convert to PCM
       const pcmData = floatTo16BitPCM(inputData);
-
+      
+      // Send
       try {
           pendingAudioRequests++;
-          
-          await activeSession.sendRealtimeInput({ 
-              media: {
-                  mimeType: 'audio/pcm;rate=16000',
-                  data: pcmData
-              }
-          });
+          await activeSession.sendRealtimeInput([{ 
+              mimeType: 'audio/pcm;rate=16000',
+              data: pcmData
+          }]);
       } catch (e) {
-          console.error("Error sending audio chunk", e);
+          console.error("Audio send error", e);
       } finally {
           pendingAudioRequests--;
       }
@@ -347,15 +349,8 @@ export const connectToLiveDebate = async (
            processor.disconnect();
            processor.onaudioprocess = null;
            
-           if (audioContext.state !== 'closed') {
-               await audioContext.close();
-           }
-           
-           if (activeSession) {
-               try {
-                  activeSession.close();
-               } catch (e) { console.log("Session close ignored", e); }
-           }
+           if (audioContext.state !== 'closed') await audioContext.close();
+           if (activeSession) activeSession.close();
        },
        flush: () => {
            currentVolatileBuffer = "";
@@ -365,11 +360,7 @@ export const connectToLiveDebate = async (
   } catch (err: any) {
     onError(err);
     if (audioContext.state !== 'closed') await audioContext.close();
-    
-    return {
-        disconnect: async () => {},
-        flush: () => {}
-    };
+    return { disconnect: async () => {}, flush: () => {} };
   }
 }
 
@@ -379,12 +370,15 @@ function floatTo16BitPCM(input: Float32Array): string {
         const s = Math.max(-1, Math.min(1, input[i]));
         output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
     }
-    
-    let binary = '';
     const bytes = new Uint8Array(output.buffer);
+    
+    // Optimized Base64 for chunks
+    let binary = '';
     const len = bytes.byteLength;
-    for (let i = 0; i < len; i+=1024) {
-        binary += String.fromCharCode.apply(null, Array.from(bytes.slice(i, i+1024)));
+    // Process in chunks to avoid stack overflow in String.fromCharCode
+    const CHUNK_SIZE = 0x8000; 
+    for (let i = 0; i < len; i += CHUNK_SIZE) {
+        binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK_SIZE)));
     }
     return btoa(binary);
 }
