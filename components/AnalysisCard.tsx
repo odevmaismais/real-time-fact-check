@@ -4,7 +4,7 @@ import { AnalysisResult, VerdictType } from '../types';
 import { AlertTriangle, CheckCircle, HelpCircle, XCircle, Info, ExternalLink } from 'lucide-react';
 
 interface AnalysisCardProps {
-  analysis: AnalysisResult; 
+  analysis: AnalysisResult;
   segmentText: string;
 }
 
