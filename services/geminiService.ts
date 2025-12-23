@@ -16,7 +16,6 @@ const cleanTranscriptText = (text: string): string => {
   return text.replace(/\s+/g, ' ').trim();
 };
 
-// Downsample robusto (48k -> 16k)
 function downsampleTo16k(input: Float32Array, inputRate: number): Int16Array {
     if (inputRate === 16000) {
         return floatTo16BitPCM(input);
@@ -151,6 +150,7 @@ export const connectToLiveDebate = async (
   
   const ai = new GoogleGenAI({ apiKey });
   
+  // Setup AudioContext
   const audioContext = new AudioContext(); 
   if (audioContext.state === 'suspended') await audioContext.resume();
 
@@ -166,7 +166,7 @@ export const connectToLiveDebate = async (
   const handleText = (raw: string) => {
       const text = cleanTranscriptText(raw);
       if (text.length > 0) {
-          console.log("📝 TRANSCRITO:", text);
+          console.log("📝 RECEBIDO:", text);
           currentBuffer += " " + text;
           onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: false });
           
@@ -184,16 +184,16 @@ export const connectToLiveDebate = async (
     activeSession = await ai.live.connect({
       model: LIVE_MODEL_NAME,
       config: {
-        // [MODIFICAÇÃO CRÍTICA] Usamos AUDIO para manter o socket 'vivo' como uma chamada.
-        // O modelo tenta falar, mas nós ignoramos o áudio recebido.
+        // [FIX 1] Modality.AUDIO mantém a conexão aberta (como uma chamada telefônica)
+        // Isso evita o Code 1000 (fechamento normal) prematuro.
         responseModalities: [Modality.AUDIO], 
         
-        // Configuramos o idioma explicitamente
+        // [FIX 2] Objeto vazio: ativa inputTranscription sem causar erro 1007 (invalid field)
         // @ts-ignore
-        inputAudioTranscription: { languageCode: "pt-BR" }, 
+        inputAudioTranscription: {}, 
         
         systemInstruction: {
-            parts: [{ text: "You are a transcriber. Listen to the Portuguese audio and output the text exactly. Do not translate. Do not answer questions. Just transcribe." }]
+            parts: [{ text: "You are a transcriber. Your ONLY job is to listen to the Portuguese audio and generate the text transcript exactly as spoken. Do not translate. Do not answer questions. Just output the Portuguese text." }]
         }
       },
       callbacks: {
@@ -203,14 +203,12 @@ export const connectToLiveDebate = async (
            onStatus?.({ type: 'info', message: "ESCUTANDO..." });
         },
         onmessage: (msg: LiveServerMessage) => {
-           // Debug profundo: ver o que está chegando
-           // console.log("Msg:", msg.serverContent);
-
+           // Verifica se a transcrição veio pelo canal de entrada (User Echo)
            const t1 = msg.serverContent?.inputTranscription?.text;
+           // Verifica se a transcrição veio como resposta do modelo (Model Turn)
            const t2 = msg.serverContent?.modelTurn?.parts?.[0]?.text;
            
            if (t1) handleText(t1);
-           // Com Modality.AUDIO, o modelTurn geralmente vem com áudio, mas pode vir com texto
            if (t2) handleText(t2);
            
            if (msg.serverContent?.turnComplete && currentBuffer) {
@@ -237,7 +235,7 @@ export const connectToLiveDebate = async (
 
       const inputData = e.inputBuffer.getChannelData(0);
       
-      // Monitor de Volume
+      // Monitor de Volume (Debug)
       let sum = 0;
       for(let i=0; i<100; i++) sum += Math.abs(inputData[i]);
       if(sum > 0.001 && Math.random() < 0.01) console.log("📊 Audio chegando no processador...");
@@ -246,13 +244,13 @@ export const connectToLiveDebate = async (
           const pcm16k = downsampleTo16k(inputData, streamRate);
           const base64Data = arrayBufferToBase64(pcm16k.buffer as ArrayBuffer);
 
-          // Envio direto e contínuo
+          // [CRÍTICO] Envio direto e correto (sem sessionPromise)
           await activeSession.sendRealtimeInput([{ 
               mimeType: "audio/pcm;rate=16000",
               data: base64Data
           }]);
       } catch (err) {
-          // console.error(err); 
+          // Ignora erros momentâneos de rede
       }
     };
 
