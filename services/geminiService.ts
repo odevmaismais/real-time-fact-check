@@ -43,7 +43,14 @@ export const analyzeStatement = async (
   segmentId: string,
   contextHistory: string[] = [] 
 ): Promise<AnalysisResult> => {
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+  // [FIX] API Key Robustness
+  const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY;
+  if (!apiKey) {
+      console.error("API Key missing");
+      throw new Error("API Key is missing from environment variables");
+  }
+  
+  const ai = new GoogleGenAI({ apiKey });
   
   try {
     const now = new Date();
@@ -76,8 +83,11 @@ export const analyzeStatement = async (
       },
     });
 
-    const jsonText = response.text();
+    // [FIX] Use property access (.text) instead of method call (.text())
+    const jsonText = response.text || "";
+    
     if (!jsonText) throw new Error("No response from AI");
+    
     const data = JSON.parse(jsonText);
     const sources = response.candidates?.[0]?.groundingMetadata?.groundingChunks
       ?.map((chunk: any) => chunk.web)
@@ -141,9 +151,15 @@ export const connectToLiveDebate = async (
   onError: (err: Error) => void,
   onStatus?: (status: LiveStatus) => void
 ): Promise<LiveConnectionController> => {
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+  // [FIX] API Key Robustness
+  const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY;
+  if (!apiKey) {
+      onError(new Error("API Key missing"));
+      return { disconnect: async () => {}, flush: () => {} };
+  }
+
+  const ai = new GoogleGenAI({ apiKey });
   
-  // [FIX 1] Removed fixed sampleRate. Let browser decide (likely 48000Hz for Youtube)
   const audioContext = new AudioContext(); 
   if (audioContext.state === 'suspended') {
     await audioContext.resume();
@@ -181,12 +197,12 @@ export const connectToLiveDebate = async (
     activeSession = await ai.live.connect({
       model: LIVE_MODEL_NAME,
       config: {
-        // [FIX 2] Request TEXT only. No AUDIO response.
+        // Request TEXT only. No AUDIO response.
         responseModalities: [Modality.TEXT], 
         speechConfig: {
           voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
         },
-        // [FIX 3] Empty object enables transcription without invalid 'model' field
+        // Empty object enables transcription without invalid 'model' field
         // @ts-ignore
         inputAudioTranscription: {}, 
         systemInstruction: {
@@ -249,7 +265,7 @@ export const connectToLiveDebate = async (
       
       try {
           pendingAudioRequests++;
-          // [FIX 4] Dynamic Sample Rate sending
+          // Dynamic Sample Rate sending
           await activeSession.sendRealtimeInput([{ 
               mimeType: `audio/pcm;rate=${audioContext.sampleRate}`,
               data: pcmData
