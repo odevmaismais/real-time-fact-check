@@ -1,9 +1,9 @@
 import { GoogleGenAI, Type, LiveServerMessage, Modality } from "@google/genai";
 import { AnalysisResult, VerdictType } from "../types";
 
-// [FIX] Usando os modelos REAIS disponíveis atualmente na API
-const MODEL_NAME = "gemini-2.0-flash-exp"; 
-const LIVE_MODEL_NAME = "gemini-2.0-flash-exp";
+// [FIX] Using recommended models per guidelines
+const MODEL_NAME = "gemini-3-flash-preview";
+const LIVE_MODEL_NAME = "gemini-2.5-flash-native-audio-preview-09-2025";
 
 export type LiveStatus = {
   type: 'info' | 'warning' | 'error';
@@ -48,7 +48,6 @@ export const analyzeStatement = async (
   segmentId: string,
   contextHistory: string[] = [] 
 ): Promise<AnalysisResult> => {
-  // [FIX] Certifique-se que REACT_APP_API_KEY ou VITE_API_KEY esteja configurado
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
   
   try {
@@ -158,15 +157,24 @@ const calculateRMS = (data: Float32Array): number => {
     return Math.sqrt(sum / data.length);
 };
 
-// [FIX] Better Base64 conversion for Audio
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-    let binary = '';
-    const bytes = new Uint8Array(buffer);
-    const len = bytes.byteLength;
-    for (let i = 0; i < len; i++) {
-        binary += String.fromCharCode(bytes[i]);
+// [OPTIMIZATION] Better Base64 conversion for Audio to avoid Stack Overflow
+function floatTo16BitPCM(input: Float32Array): string {
+    const output = new Int16Array(input.length);
+    for (let i = 0; i < input.length; i++) {
+        const s = Math.max(-1, Math.min(1, input[i]));
+        output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
     }
-    return window.btoa(binary);
+    const bytes = new Uint8Array(output.buffer);
+    
+    // Optimized Base64 for chunks
+    let binary = '';
+    const len = bytes.byteLength;
+    // Process in chunks to avoid stack overflow in String.fromCharCode
+    const CHUNK_SIZE = 0x8000; 
+    for (let i = 0; i < len; i += CHUNK_SIZE) {
+        binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK_SIZE)));
+    }
+    return btoa(binary);
 }
 
 export const connectToLiveDebate = async (
@@ -219,20 +227,16 @@ export const connectToLiveDebate = async (
   };
 
   try {
+    // [CRITICAL FIX] Callbacks are passed directly in the connect configuration object
     activeSession = await ai.live.connect({
       model: LIVE_MODEL_NAME,
       config: {
-        // [FIX] We only need Input Transcription for this use case
         responseModalities: [Modality.AUDIO], 
         speechConfig: {
           voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
         },
-        inputAudioTranscription: {
-            model: "gemini-2.0-flash-exp" // Ensure explicit transcription model if supported, or let auto
-        }, 
-        systemInstruction: {
-            parts: [{
-                text: `
+        inputAudioTranscription: {}, // Explicitly request transcription
+        systemInstruction: `
                 Role: Portuguese (Brazil) Transcriber.
                 Context: Political debate.
                 
@@ -242,61 +246,49 @@ export const connectToLiveDebate = async (
                 3. DO NOT output "Obrigado por assistir", "Legendas", or credits.
                 4. If speech is unclear, output nothing.
                 `
-            }]
-        }
       },
-    });
+      callbacks: {
+        onopen: () => {
+           console.log("🟢 Gemini Live Connected");
+           isConnected = true;
+           onStatus?.({ type: 'info', message: "LIVE LINK ESTABLISHED" });
+        },
+        onmessage: (msg: LiveServerMessage) => {
+           const inputTrx = msg.serverContent?.inputTranscription;
+           
+           if (inputTrx?.text) {
+               let text = inputTrx.text;
+               // console.log("Stream:", text);
+               
+               if (isGarbage(text)) return;
+               
+               text = cleanTranscriptText(text);
+               currentVolatileBuffer += text;
 
-    // Event Handling
-    // Note: The SDK event structure might differ slightly depending on version, 
-    // ensuring we catch the right content.
-    // @ts-ignore
-    activeSession.on('open', () => {
-        console.log("🟢 Gemini Live Connected");
-        isConnected = true;
-        onStatus?.({ type: 'info', message: "LIVE LINK ESTABLISHED" });
-    });
+               // Send 'ghost' update for UI
+               try {
+                   onTranscript({ text: currentVolatileBuffer, speaker: DEFAULT_SPEAKER, isFinal: false });
+               } catch (e) { }
+               
+               scheduleSilenceCommit();
+           }
 
-    // @ts-ignore
-    activeSession.on('message', (msg: LiveServerMessage) => {
-        // Handle Server Content (Transcription)
-        const inputTrx = msg.serverContent?.inputTranscription;
-        
-        if (inputTrx?.text) {
-            let text = inputTrx.text;
-            // console.log("Stream:", text);
-            
-            if (isGarbage(text)) return;
-            
-            text = cleanTranscriptText(text);
-            currentVolatileBuffer += text;
-
-            // Send 'ghost' update for UI
-            try {
-                onTranscript({ text: currentVolatileBuffer, speaker: DEFAULT_SPEAKER, isFinal: false });
-            } catch (e) { }
-            
-            scheduleSilenceCommit();
+           if (msg.serverContent?.turnComplete) {
+               if (currentVolatileBuffer.trim().length > 0) {
+                   commitBuffer();
+               }
+           }
+        },
+        onclose: () => {
+           console.log("🔴 Gemini Live Closed");
+           onStatus?.({ type: 'warning', message: "CONNECTION CLOSED" });
+           isConnected = false;
+        },
+        onerror: (err: any) => {
+           console.error("🔴 Gemini Live Error:", err);
+           onStatus?.({ type: 'error', message: "STREAM ERROR" });
         }
-
-        if (msg.serverContent?.turnComplete) {
-            if (currentVolatileBuffer.trim().length > 0) {
-                commitBuffer();
-            }
-        }
-    });
-
-    // @ts-ignore
-    activeSession.on('close', () => {
-        console.log("🔴 Gemini Live Closed");
-        onStatus?.({ type: 'warning', message: "CONNECTION CLOSED" });
-        isConnected = false;
-    });
-
-    // @ts-ignore
-    activeSession.on('error', (err: any) => {
-        console.error("🔴 Gemini Live Error:", err);
-        onStatus?.({ type: 'error', message: "STREAM ERROR" });
+      }
     });
 
     isConnected = true;
@@ -362,23 +354,4 @@ export const connectToLiveDebate = async (
     if (audioContext.state !== 'closed') await audioContext.close();
     return { disconnect: async () => {}, flush: () => {} };
   }
-}
-
-function floatTo16BitPCM(input: Float32Array): string {
-    const output = new Int16Array(input.length);
-    for (let i = 0; i < input.length; i++) {
-        const s = Math.max(-1, Math.min(1, input[i]));
-        output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-    }
-    const bytes = new Uint8Array(output.buffer);
-    
-    // Optimized Base64 for chunks
-    let binary = '';
-    const len = bytes.byteLength;
-    // Process in chunks to avoid stack overflow in String.fromCharCode
-    const CHUNK_SIZE = 0x8000; 
-    for (let i = 0; i < len; i += CHUNK_SIZE) {
-        binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK_SIZE)));
-    }
-    return btoa(binary);
 }

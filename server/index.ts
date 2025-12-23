@@ -1,4 +1,3 @@
-
 import express from 'express';
 import cors from 'cors';
 import { connectToDb, getDb } from './db';
@@ -7,8 +6,8 @@ import { ObjectId } from 'mongodb';
 const app = express();
 const PORT = 3001;
 
-app.use(cors());
-app.use(express.json());
+app.use(cors() as any);
+app.use(express.json() as any);
 
 // Initialize DB connection but don't block server startup
 connectToDb().catch(err => console.error("Initial DB connection failed", err));
