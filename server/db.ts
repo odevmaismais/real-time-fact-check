@@ -6,7 +6,7 @@ const DB_NAME = "dossie_oculto_logs";
 let cachedDb: Db | null = null;
 
 // Extensão do objeto global para cache em desenvolvimento (HMR)
-let globalWithMongo = global as typeof globalThis & {
+let globalWithMongo = globalThis as typeof globalThis & {
   _mongoDb?: Db;
 };
 

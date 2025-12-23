@@ -1,7 +1,7 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { connectToDb } from '../../../server/db';
 import { ObjectId } from 'mongodb';
-
+ 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   // CORS Headers
   res.setHeader('Access-Control-Allow-Credentials', 'true');
