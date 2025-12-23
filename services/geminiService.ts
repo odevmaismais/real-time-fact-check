@@ -94,7 +94,8 @@ export const analyzeStatement = async (
       },
     });
 
-    const jsonText = response.text; // Propriedade getter, não função
+    // CORREÇÃO: Usando propriedade .text (sem parênteses)
+    const jsonText = response.text;
     
     if (!jsonText) throw new Error("No response from AI");
     
