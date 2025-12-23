@@ -1,9 +1,9 @@
 import { GoogleGenAI, Type, LiveServerMessage, Modality } from "@google/genai";
 import { AnalysisResult, VerdictType } from "../types";
 
-// [FIX] Using recommended models per guidelines
-const MODEL_NAME = "gemini-3-flash-preview";
-const LIVE_MODEL_NAME = "gemini-2.5-flash-native-audio-preview-09-2025";
+// [CRITICAL] Using the specific model requested that supports Live API reliably
+const MODEL_NAME = "gemini-2.0-flash-exp";
+const LIVE_MODEL_NAME = "gemini-2.0-flash-exp";
 
 export type LiveStatus = {
   type: 'info' | 'warning' | 'error';
@@ -16,8 +16,7 @@ const isGarbage = (text: string): boolean => {
   const t = text.trim();
   if (t.length === 0) return true;
 
-  // Filtro básico de ruído estrutural
-  // Se for apenas uma letra (exceto as vogais e 'y' comuns) ou símbolos
+  // Structural noise filter
   const allowList = [
       'a', 'e', 'é', 'o', 'ó', 'u', 'à', 'y', 
       'oi', 'ai', 'ui', 'eu', 'tu', 'ele', 'nós', 'vós', 
@@ -36,7 +35,7 @@ const cleanTranscriptText = (text: string): string => {
   if (!text) return "";
   let cleaned = text;
   cleaned = cleaned.replace(/\s+/g, ' ');
-  // Remove gagueira repetitiva (ex: "o o o que")
+  // Remove stutter
   cleaned = cleaned.replace(/\b(\w+)( \1){2,}\b/gi, '$1'); 
   return cleaned;
 };
@@ -157,7 +156,7 @@ const calculateRMS = (data: Float32Array): number => {
     return Math.sqrt(sum / data.length);
 };
 
-// [OPTIMIZATION] Better Base64 conversion for Audio to avoid Stack Overflow
+// Optimized Base64 conversion for Audio chunks to avoid Stack Overflow
 function floatTo16BitPCM(input: Float32Array): string {
     const output = new Int16Array(input.length);
     for (let i = 0; i < input.length; i++) {
@@ -166,10 +165,8 @@ function floatTo16BitPCM(input: Float32Array): string {
     }
     const bytes = new Uint8Array(output.buffer);
     
-    // Optimized Base64 for chunks
     let binary = '';
     const len = bytes.byteLength;
-    // Process in chunks to avoid stack overflow in String.fromCharCode
     const CHUNK_SIZE = 0x8000; 
     for (let i = 0; i < len; i += CHUNK_SIZE) {
         binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK_SIZE)));
@@ -185,7 +182,6 @@ export const connectToLiveDebate = async (
 ): Promise<LiveConnectionController> => {
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
   
-  // [FIX] Ensure AudioContext is handled correctly across browsers
   const audioContext = new AudioContext({ sampleRate: 16000 });
   if (audioContext.state === 'suspended') {
     await audioContext.resume();
@@ -200,9 +196,11 @@ export const connectToLiveDebate = async (
   let silenceTimer: any = null;
   let activeSession: any = null;
   
-  const VAD_THRESHOLD = 0.002; 
+  // [FIX] Highly sensitive VAD to prevent dropouts
+  const VAD_THRESHOLD = 0.001; 
   const SILENCE_HANGOVER_CHUNKS = 5; 
   let silenceChunkCount = 0;
+  
   let pendingAudioRequests = 0;
   const MAX_PENDING_REQUESTS = 10; 
 
@@ -227,7 +225,7 @@ export const connectToLiveDebate = async (
   };
 
   try {
-    // [CRITICAL FIX] Callbacks are passed directly in the connect configuration object
+    // [CRITICAL] Passing 'callbacks' directly in the parameter object
     activeSession = await ai.live.connect({
       model: LIVE_MODEL_NAME,
       config: {
@@ -235,8 +233,13 @@ export const connectToLiveDebate = async (
         speechConfig: {
           voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
         },
-        inputAudioTranscription: {}, // Explicitly request transcription
-        systemInstruction: `
+        // [CRITICAL] Explicitly enabling transcription with the correct model
+        inputAudioTranscription: {
+            model: LIVE_MODEL_NAME 
+        }, 
+        systemInstruction: {
+            parts: [{
+                text: `
                 Role: Portuguese (Brazil) Transcriber.
                 Context: Political debate.
                 
@@ -246,14 +249,19 @@ export const connectToLiveDebate = async (
                 3. DO NOT output "Obrigado por assistir", "Legendas", or credits.
                 4. If speech is unclear, output nothing.
                 `
+            }]
+        }
       },
       callbacks: {
         onopen: () => {
-           console.log("🟢 Gemini Live Connected");
+           console.log("🟢 Gemini Live Connected (" + LIVE_MODEL_NAME + ")");
            isConnected = true;
            onStatus?.({ type: 'info', message: "LIVE LINK ESTABLISHED" });
         },
         onmessage: (msg: LiveServerMessage) => {
+           // Debuging raw message to ensure we are getting transcription
+           // console.log("Msg:", msg);
+
            const inputTrx = msg.serverContent?.inputTranscription;
            
            if (inputTrx?.text) {
@@ -297,13 +305,13 @@ export const connectToLiveDebate = async (
       if (!isConnected || !activeSession) return; 
 
       if (pendingAudioRequests >= MAX_PENDING_REQUESTS) {
-          // Drop frame to catch up
+          // Drop frame to catch up and prevent lag
           return;
       }
 
       const inputData = e.inputBuffer.getChannelData(0);
       
-      // Simple VAD
+      // VAD Check
       const rms = calculateRMS(inputData);
       if (rms < VAD_THRESHOLD) {
           silenceChunkCount++;
@@ -315,7 +323,7 @@ export const connectToLiveDebate = async (
       // Convert to PCM
       const pcmData = floatTo16BitPCM(inputData);
       
-      // Send
+      // Send to API
       try {
           pendingAudioRequests++;
           await activeSession.sendRealtimeInput([{ 
