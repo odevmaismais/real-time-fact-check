@@ -191,7 +191,12 @@ export const connectToLiveDebate = async (
 
   const ai = new GoogleGenAI({ apiKey });
   
-  const audioContext = new AudioContext({ sampleRate: 16000 });
+  // [MODIFIED] Do not force sampleRate here. Let browser use native hardware rate.
+  const audioContext = new AudioContext(); 
+  
+  // [DEBUG] Log the actual rate being used
+  console.log("Audio Rate:", audioContext.sampleRate);
+
   if (audioContext.state === 'suspended') {
     await audioContext.resume();
   }
@@ -326,7 +331,8 @@ export const connectToLiveDebate = async (
           // The content must be wrapped in a 'media' object.
           await activeSession.sendRealtimeInput([{ 
               media: {
-                  mimeType: 'audio/pcm;rate=16000',
+                  // [MODIFIED] Dynamically use the AudioContext sample rate
+                  mimeType: `audio/pcm;rate=${audioContext.sampleRate}`,
                   data: pcmData
               }
           }]);
