@@ -197,7 +197,8 @@ export const connectToLiveDebate = async (
 
   const ai = new GoogleGenAI({ apiKey });
   
-  // [CRITICAL] 1. Use Native AudioContext (no specific sample rate)
+  // [CRITICAL] 1. Use Native AudioContext without forcing sampleRate
+  // This allows the browser to use 44.1kHz or 48kHz depending on hardware, preventing Code 1000.
   const audioContext = new AudioContext(); 
   const currentSampleRate = audioContext.sampleRate;
   console.log("Audio Context Rate:", currentSampleRate);
@@ -246,10 +247,12 @@ export const connectToLiveDebate = async (
     activeSession = await ai.live.connect({
       model: LIVE_MODEL_NAME,
       config: {
-        // [CRITICAL] 2. Maintain Modality.TEXT
+        // [CRITICAL] 2. Set Modality to TEXT and enable inputAudioTranscription
         responseModalities: [Modality.TEXT], 
-        // [FIX] Removed speechConfig (not needed for text output)
-        // [FIX] Removed inputAudioTranscription (caused Error 1007)
+        
+        // [FIX] Explicitly enable transcription with an empty object as per Gemini 2.0 Live docs
+        inputAudioTranscription: {}, 
+
         systemInstruction: "You are a live transcriber. Your job is to listen to the audio stream and output the Portuguese text EXACTLY as spoken. Do not summarize. Do not answer. Just write down the words immediately. If there is silence, output nothing."
       },
       callbacks: {
@@ -259,7 +262,7 @@ export const connectToLiveDebate = async (
            onStatus?.({ type: 'info', message: "LIVE LINK ESTABLISHED" });
         },
         onmessage: (msg: LiveServerMessage) => {
-           // With inputAudioTranscription removed, we rely on the model 'replying' with the text
+           // We look for text in the model's turn (since the model is acting as the transcriber via prompt)
            const textParts = msg.serverContent?.modelTurn?.parts;
            if (textParts) {
                for (const part of textParts) {
@@ -324,7 +327,7 @@ export const connectToLiveDebate = async (
           pendingAudioRequests++;
           await activeSession.sendRealtimeInput([{ 
               media: {
-                  // [CRITICAL] Dynamic Sample Rate in MimeType
+                  // [CRITICAL] Dynamic Sample Rate in MimeType matches AudioContext
                   mimeType: `audio/pcm;rate=${currentSampleRate}`,
                   data: base64Data
               }
