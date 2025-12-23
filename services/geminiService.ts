@@ -1,7 +1,6 @@
 import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
 import { AnalysisResult, VerdictType } from "../types";
 
-// [CRITICAL] Using the specific model requested that supports Live API reliably
 const MODEL_NAME = "gemini-2.0-flash-exp";
 const LIVE_MODEL_NAME = "gemini-2.0-flash-exp";
 
@@ -15,7 +14,7 @@ export type LiveStatus = {
 const isGarbage = (text: string): boolean => {
   const t = text.trim();
   if (t.length === 0) return true;
-  // Structural noise filter
+  // Filtro básico de ruído estrutural
   const allowList = [
       'a', 'e', 'é', 'o', 'ó', 'u', 'à', 'y', 
       'oi', 'ai', 'ui', 'eu', 'tu', 'ele', 'nós', 'vós', 
@@ -31,11 +30,30 @@ const cleanTranscriptText = (text: string): string => {
   if (!text) return "";
   let cleaned = text;
   cleaned = cleaned.replace(/\s+/g, ' ');
-  // Remove stutter
+  // Remove gagueira (ex: "eu eu eu acho")
   cleaned = cleaned.replace(/\b(\w+)( \1){2,}\b/gi, '$1'); 
   return cleaned;
 };
 
+// Conversão otimizada Float32 -> Int16 PCM
+function floatTo16BitPCM(input: Float32Array): string {
+    const output = new Int16Array(input.length);
+    for (let i = 0; i < input.length; i++) {
+        const s = Math.max(-1, Math.min(1, input[i]));
+        output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+    const bytes = new Uint8Array(output.buffer);
+    let binary = '';
+    const len = bytes.byteLength;
+    const CHUNK_SIZE = 0x8000; 
+    for (let i = 0; i < len; i += CHUNK_SIZE) {
+        binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK_SIZE)));
+    }
+    return btoa(binary);
+}
+
+// -------------------------------------------
+// FUNÇÃO DE ANÁLISE (FACT CHECKING)
 // -------------------------------------------
 
 export const analyzeStatement = async (
@@ -43,34 +61,27 @@ export const analyzeStatement = async (
   segmentId: string,
   contextHistory: string[] = [] 
 ): Promise<AnalysisResult> => {
-  // [FIX] API Key Robustness
   const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY;
-  if (!apiKey) {
-      console.error("API Key missing");
-      throw new Error("API Key is missing from environment variables");
-  }
+  if (!apiKey) throw new Error("API Key is missing");
   
   const ai = new GoogleGenAI({ apiKey });
   
   try {
     const now = new Date();
-    const formattedDate = now.toLocaleDateString('pt-BR', { dateStyle: 'full' });
-    const formattedTime = now.toLocaleTimeString('pt-BR');
-
     const contextBlock = contextHistory.length > 0 
       ? `IMMEDIATE CONTEXT (Previous statements):\n${contextHistory.map((s, i) => `-${i+1}: "${s}"`).join('\n')}`
-      : "IMMEDIATE CONTEXT: None (Start of debate)";
+      : "IMMEDIATE CONTEXT: None";
 
     const prompt = `
-      SYSTEM_TIME: ${formattedDate}, ${formattedTime}.
+      SYSTEM_TIME: ${now.toISOString()}.
       TASK: Real-time Fact Checking of Brazilian Political Debate.
       ${contextBlock}
       TARGET STATEMENT TO ANALYZE: "${text}"
       EXECUTION PROTOCOL:
-      1. CLASSIFICATION: Determine if "TARGET STATEMENT" contains a Checkable Factual Claim.
-         - If OPINION/RHETORIC: Return verdict "OPINION" immediately. DO NOT use Google Search.
-         - If FACTUAL CLAIM: You MUST use the 'googleSearch' tool.
-      2. CONTEXTUALIZATION: Use the "IMMEDIATE CONTEXT" to resolve pronouns.
+      1. CLASSIFICATION: Is this a Checkable Factual Claim?
+         - If OPINION/RHETORIC: Return verdict "OPINION".
+         - If FACTUAL CLAIM: You MUST use 'googleSearch'.
+      2. CONTEXTUALIZATION: Resolve pronouns using context.
       RETURN JSON FORMAT (pt-BR).
     `;
 
@@ -83,8 +94,7 @@ export const analyzeStatement = async (
       },
     });
 
-    // [FIX] Use property access (.text) instead of method call (.text())
-    const jsonText = response.text;
+    const jsonText = response.text; // Propriedade getter, não função
     
     if (!jsonText) throw new Error("No response from AI");
     
@@ -117,32 +127,13 @@ export const analyzeStatement = async (
   }
 };
 
+// -------------------------------------------
+// FUNÇÃO DE CONEXÃO LIVE (STREAMING)
+// -------------------------------------------
+
 export interface LiveConnectionController {
     disconnect: () => Promise<void>;
     flush: () => void;
-}
-
-const calculateRMS = (data: Float32Array): number => {
-    let sum = 0;
-    for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
-    return Math.sqrt(sum / data.length);
-};
-
-// Optimized Base64 conversion
-function floatTo16BitPCM(input: Float32Array): string {
-    const output = new Int16Array(input.length);
-    for (let i = 0; i < input.length; i++) {
-        const s = Math.max(-1, Math.min(1, input[i]));
-        output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-    }
-    const bytes = new Uint8Array(output.buffer);
-    let binary = '';
-    const len = bytes.byteLength;
-    const CHUNK_SIZE = 0x8000; 
-    for (let i = 0; i < len; i += CHUNK_SIZE) {
-        binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK_SIZE)));
-    }
-    return btoa(binary);
 }
 
 export const connectToLiveDebate = async (
@@ -151,7 +142,6 @@ export const connectToLiveDebate = async (
   onError: (err: Error) => void,
   onStatus?: (status: LiveStatus) => void
 ): Promise<LiveConnectionController> => {
-  // [FIX] API Key Robustness
   const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY;
   if (!apiKey) {
       onError(new Error("API Key missing"));
@@ -160,22 +150,20 @@ export const connectToLiveDebate = async (
 
   const ai = new GoogleGenAI({ apiKey });
   
+  // Audio Setup
   const audioContext = new AudioContext(); 
   if (audioContext.state === 'suspended') {
     await audioContext.resume();
   }
 
   const source = audioContext.createMediaStreamSource(stream);
+  // ScriptProcessor is deprecated but reliable for raw PCM extraction in pure JS/TS without Worklets
   const processor = audioContext.createScriptProcessor(4096, 1, 1);
   
   let currentVolatileBuffer = "";
   let isConnected = false;
-  let silenceTimer: any = null;
   let activeSession: any = null;
-  
-  const VAD_THRESHOLD = 0.001; 
-  let silenceChunkCount = 0;
-  let pendingAudioRequests = 0;
+  let silenceTimer: any = null;
 
   const commitBuffer = () => {
     if (currentVolatileBuffer.trim().length > 0) {
@@ -188,26 +176,27 @@ export const connectToLiveDebate = async (
       if (silenceTimer) clearTimeout(silenceTimer);
       silenceTimer = setTimeout(() => {
           if (currentVolatileBuffer.trim().length > 0) commitBuffer();
-      }, 1500); 
+      }, 2000); 
   };
 
   try {
-    console.log("🎤 Audio Context Rate:", audioContext.sampleRate); // Debug
+    console.log(`🎤 Connecting to Live Model: ${LIVE_MODEL_NAME} | Rate: ${audioContext.sampleRate}`);
 
+    // [BARE METAL CONFIG]
     activeSession = await ai.live.connect({
       model: LIVE_MODEL_NAME,
       config: {
-        // Request TEXT only. No AUDIO response.
+        // [CRITICAL] Text ONLY. Adding Audio here often causes "Code 1000" if output handling isn't perfect.
         responseModalities: [Modality.TEXT], 
-        speechConfig: {
-          voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
-        },
-        // Empty object enables transcription without invalid 'model' field
+        
+        // [CRITICAL] Enable Transcription (Empty Object per SDK requirements for pure transcription)
         // @ts-ignore
         inputAudioTranscription: {}, 
+        
+        // [CRITICAL] Simple Instruction. No tools. No weird configs.
         systemInstruction: {
             parts: [{
-                text: "Transcreva o debate político em Português (Brasil) EXATAMENTE como falado. Ignore ruídos."
+                text: "Transcribe the audio to text."
             }]
         }
       },
@@ -215,25 +204,29 @@ export const connectToLiveDebate = async (
         onopen: () => {
            console.log("🟢 Gemini Live Connected");
            isConnected = true;
-           onStatus?.({ type: 'info', message: "CONECTADO AO YOUTUBE" });
+           onStatus?.({ type: 'info', message: "CONECTADO: ESCUTANDO..." });
         },
         onmessage: (msg: LiveServerMessage) => {
+           // Handle Transcription
            const inputTrx = msg.serverContent?.inputTranscription;
            if (inputTrx?.text) {
-               let text = cleanTranscriptText(inputTrx.text);
+               const text = cleanTranscriptText(inputTrx.text);
                if (!isGarbage(text)) {
                    currentVolatileBuffer += text;
+                   // Send "interim" result
                    onTranscript({ text: currentVolatileBuffer, speaker: "DEBATE", isFinal: false });
                    scheduleSilenceCommit();
                }
            }
+           
+           // Handle Turn Complete (Model finished thinking/processing a chunk)
            if (msg.serverContent?.turnComplete) {
                commitBuffer();
            }
         },
         onclose: (e) => {
            console.log("🔴 Gemini Live Closed", e);
-           onStatus?.({ type: 'warning', message: "DESCONECTADO" });
+           onStatus?.({ type: 'warning', message: `DESCONECTADO (Code ${e.code})` });
            isConnected = false;
         },
         onerror: (err: any) => {
@@ -245,43 +238,36 @@ export const connectToLiveDebate = async (
 
     isConnected = true;
 
+    // [AUDIO PROCESSING LOOP]
     processor.onaudioprocess = async (e) => {
       if (!isConnected || !activeSession) return; 
 
-      if (pendingAudioRequests >= 10) return;
-
       const inputData = e.inputBuffer.getChannelData(0);
-      const rms = calculateRMS(inputData);
       
-      // Simples VAD
-      if (rms < VAD_THRESHOLD) {
-          silenceChunkCount++;
-          if (silenceChunkCount > 5) return; 
-      } else {
-          silenceChunkCount = 0;
-      }
-
+      // [CRITICAL] VAD REMOVED. SEND EVERYTHING.
+      // If we filter silence here, the server might think the connection died if the video is quiet.
+      // We send the raw PCM and let the model decide what is silence.
+      
       const pcmData = floatTo16BitPCM(inputData);
       
       try {
-          pendingAudioRequests++;
-          // Dynamic Sample Rate sending
-          await activeSession.sendRealtimeInput([{ 
+          // Dynamic Sample Rate is safer than hardcoded 16000
+          activeSession.sendRealtimeInput([{ 
               mimeType: `audio/pcm;rate=${audioContext.sampleRate}`,
               data: pcmData
           }]);
-      } catch (e) {
-          console.error("Audio send error", e);
-      } finally {
-          pendingAudioRequests--;
+      } catch (error) {
+          console.error("Audio Send Error:", error);
       }
     };
 
+    // Connect Graph
     source.connect(processor);
     processor.connect(audioContext.destination);
 
     return {
        disconnect: async () => {
+           console.log("Terminating session...");
            isConnected = false;
            source.disconnect();
            processor.disconnect();
