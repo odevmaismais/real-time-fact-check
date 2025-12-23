@@ -191,7 +191,7 @@ export const connectToLiveDebate = async (
 
   const ai = new GoogleGenAI({ apiKey });
   
-  // [MODIFIED] Do not force sampleRate here. Let browser use native hardware rate.
+  // [CORRECTION 1] Removed fixed sampleRate to allow native hardware rate
   const audioContext = new AudioContext(); 
   
   // [DEBUG] Log the actual rate being used
@@ -243,14 +243,13 @@ export const connectToLiveDebate = async (
     activeSession = await ai.live.connect({
       model: LIVE_MODEL_NAME,
       config: {
-        responseModalities: [Modality.AUDIO], 
+        // [CORRECTION 3] Changed to TEXT modality
+        responseModalities: [Modality.TEXT], 
         speechConfig: {
           voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
         },
-        // [CRITICAL] Explicitly enabling transcription. 
-        // Using an empty object {} allows the model to use default transcription settings.
-        // Specifying a model name here often causes connection closure if incorrect.
-        inputAudioTranscription: {}, 
+        // [CORRECTION 4] Explicitly setting model for input transcription
+        inputAudioTranscription: { model: LIVE_MODEL_NAME }, 
         systemInstruction: "Role: Portuguese (Brazil) Transcriber. Context: Political debate. Rules: Transcribe spoken Portuguese exactly. IGNORE background noise. DO NOT output credits."
       },
       callbacks: {
@@ -327,11 +326,9 @@ export const connectToLiveDebate = async (
       // Send to API
       try {
           pendingAudioRequests++;
-          // [FIX] 'sendRealtimeInput' requires a RealtimeInput array.
-          // The content must be wrapped in a 'media' object.
           await activeSession.sendRealtimeInput([{ 
               media: {
-                  // [MODIFIED] Dynamically use the AudioContext sample rate
+                  // [CORRECTION 2] Dynamic Sample Rate
                   mimeType: `audio/pcm;rate=${audioContext.sampleRate}`,
                   data: pcmData
               }
