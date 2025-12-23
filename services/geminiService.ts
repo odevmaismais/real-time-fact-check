@@ -27,9 +27,7 @@ function downsampleTo16k(input: Float32Array, inputRate: number): Int16Array {
     
     for (let i = 0; i < newLength; i++) {
         const offset = Math.floor(i * ratio);
-        // Proteção de limites
         const val = input[Math.min(offset, input.length - 1)];
-        // Clamp e conversão
         const s = Math.max(-1, Math.min(1, val));
         output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
     }
@@ -49,8 +47,11 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
     let binary = '';
     const bytes = new Uint8Array(buffer);
     const len = bytes.byteLength;
-    for (let i = 0; i < len; i++) {
-        binary += String.fromCharCode(bytes[i]);
+    const chunkSize = 0x8000; // Processar em chunks para evitar stack overflow em grandes buffers
+    
+    for (let i = 0; i < len; i += chunkSize) {
+        const chunk = bytes.subarray(i, Math.min(i + chunkSize, len));
+        binary += String.fromCharCode.apply(null, Array.from(chunk));
     }
     return btoa(binary);
 }
@@ -86,7 +87,6 @@ export const analyzeStatement = async (
       },
     });
 
-    // CORREÇÃO: Propriedade .text (sem parenteses)
     const jsonText = response.text; 
     
     if (!jsonText) return {
@@ -151,9 +151,8 @@ export const connectToLiveDebate = async (
   
   const ai = new GoogleGenAI({ apiKey });
   
-  // Tenta criar contexto em 16kHz (o navegador pode ou não aceitar)
-  // Se não aceitar, usamos o nativo e fazemos downsample manual.
-  const audioContext = new AudioContext({ sampleRate: 16000 }); 
+  // Audio Context Setup
+  const audioContext = new AudioContext(); 
   if (audioContext.state === 'suspended') await audioContext.resume();
 
   const source = audioContext.createMediaStreamSource(stream);
@@ -188,7 +187,7 @@ export const connectToLiveDebate = async (
         // @ts-ignore
         inputAudioTranscription: { languageCode: "pt-BR" }, 
         systemInstruction: {
-            parts: [{ text: "Transcreva o áudio para Português." }]
+            parts: [{ text: "Você é um sistema de transcrição em tempo real. Sua ÚNICA função é transcrever o áudio recebido para texto em Português, continuamente. Não responda ao conteúdo, apenas transcreva." }]
         }
       },
       callbacks: {
@@ -196,11 +195,11 @@ export const connectToLiveDebate = async (
            console.log("🟢 Conectado ao Gemini Live!");
            isConnected = true;
            onStatus?.({ type: 'info', message: "ESCUTANDO..." });
-           // Envia mensagem inicial para 'acordar' a sessão
-           activeSession.send([{ text: "Iniciando transcrição." }]);
+           // REMOVIDO: activeSession.send(...) 
+           // Enviar mensagem de texto aqui faz o modelo responder e fechar o turno (Code 1000).
+           // Deixamos apenas o fluxo de áudio iniciar a interação.
         },
         onmessage: (msg: LiveServerMessage) => {
-           // Verifica todos os canais possíveis de texto
            const t1 = msg.serverContent?.inputTranscription?.text;
            const t2 = msg.serverContent?.modelTurn?.parts?.[0]?.text;
            
@@ -214,7 +213,7 @@ export const connectToLiveDebate = async (
         },
         onclose: (e) => {
            console.log("🔴 Fechado:", e);
-           if(isConnected) onStatus?.({ type: 'warning', message: "DESCONECTADO" });
+           if(isConnected) onStatus?.({ type: 'warning', message: `DESCONECTADO (${e.code})` });
            isConnected = false;
         },
         onerror: (err) => {
@@ -231,16 +230,8 @@ export const connectToLiveDebate = async (
 
       const inputData = e.inputBuffer.getChannelData(0);
       
-      // Monitor visual de volume
-      let sum = 0; 
-      for(let i=0;i<inputData.length;i+=100) sum+=Math.abs(inputData[i]);
-      if(sum < 0.01 && Math.random() < 0.01) console.log("⚠️ Silêncio detectado (Check a aba do YT)");
-
       try {
-          // DOWNSAMPLING OBRIGATÓRIO PARA 16kHz
           const pcm16k = downsampleTo16k(inputData, streamRate);
-          
-          // CORREÇÃO CRÍTICA DE BUILD: Cast para ArrayBuffer
           const base64Data = arrayBufferToBase64(pcm16k.buffer as ArrayBuffer);
 
           await activeSession.sendRealtimeInput([{ 
@@ -248,7 +239,7 @@ export const connectToLiveDebate = async (
               data: base64Data
           }]);
       } catch (err) {
-          console.error("Erro envio áudio", err);
+          // Erros silenciosos de envio (comuns se a conexão cair milissegundos antes)
       }
     };
 

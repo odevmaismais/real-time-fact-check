@@ -93,18 +93,14 @@ const App: React.FC = () => {
   };
 
   // --- CONSUMER: PROCESS QUEUE ---
-  // We need to access the 'segments' state to get context, so we add it to deps.
-  // Note: To avoid infinite loops, we are careful about setting state inside.
   useEffect(() => {
     const processQueue = async () => {
-        // If busy or empty, do nothing
         if (isProcessing || analysisQueue.length === 0) return;
 
         setIsProcessing(true);
-        const segment = analysisQueue[0]; // Peek
+        const segment = analysisQueue[0]; 
 
         try {
-            // FILTER: Strict Gating (Only analyze substantial segments)
             const trimmedText = segment.text.trim();
             const wordCount = trimmedText.split(/\s+/).length;
             const charCount = trimmedText.length;
@@ -113,8 +109,6 @@ const App: React.FC = () => {
             const isComplete = endsWithPunctuation || charCount > 120;
 
             if (isSubstantial && isComplete) {
-                // CONTEXT EXTRACTION
-                // Get the last 3 segments excluding the current one being processed
                 const recentHistory = segments
                     .filter(s => s.id !== segment.id)
                     .slice(-3)
@@ -129,7 +123,6 @@ const App: React.FC = () => {
 
                 setAnalyses(prev => ({ ...prev, [segment.id]: analysis }));
                 
-                // LOGGING: Save to Database
                 if (sessionIdRef.current) {
                     loggingService.logAnalysis(sessionIdRef.current, segment, analysis);
                 }
@@ -151,18 +144,12 @@ const App: React.FC = () => {
         } catch (err) {
             console.error("Processing error", err);
         } finally {
-            // Remove from queue regardless of success/failure
             setAnalysisQueue(prev => prev.slice(1));
             setIsProcessing(false);
         }
     };
 
     processQueue();
-    // Intentionally omitting 'segments' from deps to avoid re-triggering processing when ONLY the history updates.
-    // However, this means we might read stale 'segments' inside the effect closure.
-    // FIX: We can use a functional update or useRef for context, but for now we assume 
-    // the queue logic driving the effect is sufficient. 
-    // Actually, for correctness in React 18:
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [analysisQueue, isProcessing]); 
 
@@ -170,7 +157,6 @@ const App: React.FC = () => {
   // --- PRODUCER: HANDLE INCOMING TRANSCRIPTS ---
   const handleTranscriptData = useCallback((data: { text: string; speaker: string; isFinal: boolean }) => {
      if (!data.isFinal) {
-         // Update ghost text with current buffer prefix if exists
          const displayText = pendingMergeBufferRef.current 
              ? `${pendingMergeBufferRef.current} ${data.text}`
              : data.text;
@@ -178,27 +164,20 @@ const App: React.FC = () => {
      } else {
          const incomingText = data.text.trim();
          
-         // --- MERGE LOGIC ---
-         // If we have a pending buffer, prepend it
          let fullText = pendingMergeBufferRef.current 
              ? `${pendingMergeBufferRef.current} ${incomingText}`
              : incomingText;
 
-         // Check if this new "Final" is actually a complete thought
-         // Heuristic: Ends with strong punctuation OR is long enough
          const hasTerminalPunctuation = /[.?!]$/.test(fullText);
          const isLongEnough = fullText.length > 80;
 
-         // If it's too short and lacks punctuation, it might be a fragmented sentence.
-         // Hold it in the buffer for the next chunk.
          if (!hasTerminalPunctuation && !isLongEnough && fullText.length < 50) {
              console.log("Buffering fragment:", fullText);
              pendingMergeBufferRef.current = fullText;
-             setCurrentStreamingText(fullText + "..."); // Keep showing as ghost
+             setCurrentStreamingText(fullText + "..."); 
              return;
          }
 
-         // If we are here, we are committing the segment
          const newSegment: DebateSegment = {
             id: uuidv4(),
             speaker: data.speaker,
@@ -206,25 +185,15 @@ const App: React.FC = () => {
             timestamp: Date.now()
          };
          
-         // Clear buffer
          pendingMergeBufferRef.current = "";
-         
-         // 1. Update UI Feed immediately
          setSegments(prev => [...prev, newSegment]);
-         setCurrentStreamingText(''); // Clear ghost text
-
-         // 2. Add to Analysis Queue (Background Processing)
+         setCurrentStreamingText(''); 
          setAnalysisQueue(prev => [...prev, newSegment]);
      }
   }, []);
 
-  // MANUAL CUT FUNCTION
   const forceCutSegment = () => {
-      // Determine what to cut.
-      // If there is streaming text, cut that.
-      // If there is only buffer text (paused), cut that.
       let textToCut = currentStreamingText || pendingMergeBufferRef.current;
-      
       if (!textToCut.trim()) return;
       
       const newSegment: DebateSegment = {
@@ -237,11 +206,9 @@ const App: React.FC = () => {
       setSegments(prev => [...prev, newSegment]);
       setAnalysisQueue(prev => [...prev, newSegment]);
 
-      // Reset all buffers
       pendingMergeBufferRef.current = "";
       setCurrentStreamingText('');
       
-      // Flush Service Buffer
       if (liveControlRef.current) {
           liveControlRef.current.flush();
       }
@@ -250,7 +217,7 @@ const App: React.FC = () => {
   const startListening = async () => {
     if (inputMode === 'none') return;
     
-    // Start Logging Session
+    // Start Logging
     const sid = await loggingService.startSession(inputMode);
     if (sid) sessionIdRef.current = sid;
 
@@ -264,14 +231,21 @@ const App: React.FC = () => {
     try {
         let stream: MediaStream;
         
-        if (inputMode === 'mic') {
-            stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        } else {
-            stream = await navigator.mediaDevices.getDisplayMedia({ 
-                video: { displaySurface: "browser" }, 
-                audio: true,
-                preferCurrentTab: false,
-            } as any);
+        try {
+            if (inputMode === 'mic') {
+                stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            } else {
+                stream = await navigator.mediaDevices.getDisplayMedia({ 
+                    video: { displaySurface: "browser" }, 
+                    audio: true,
+                    preferCurrentTab: false,
+                } as any);
+            }
+        } catch (mediaErr: any) {
+            if (mediaErr.name === 'NotAllowedError') {
+                throw new Error("Permission denied");
+            }
+            throw mediaErr;
         }
 
         const audioContext = new AudioContext();
@@ -290,8 +264,9 @@ const App: React.FC = () => {
             handleTranscriptData,
             (err) => {
                 console.error("Live Error", err);
-                stopListening();
-                setLiveStatus({ type: 'error', message: "Connection lost. Check API Key or Network." });
+                // Don't recursive stop loop, just clean up
+                setIsListening(false);
+                setLiveStatus({ type: 'error', message: "Connection lost." });
             },
             (status) => {
                 setLiveStatus(status);
@@ -300,18 +275,22 @@ const App: React.FC = () => {
         
         liveControlRef.current = controller;
 
-    } catch (err) {
+    } catch (err: any) {
         console.error("Failed to start listening", err);
         setIsListening(false);
-        setLiveStatus({ type: 'error', message: "Failed to access audio source." });
         if (liveTimerRef.current) clearInterval(liveTimerRef.current);
+        
+        if (err.message === "Permission denied") {
+             setLiveStatus({ type: 'error', message: "Microphone Access Denied" });
+        } else {
+             setLiveStatus({ type: 'error', message: "Failed to access audio source." });
+        }
     }
   };
 
   const stopListening = async () => {
       setIsListening(false);
       
-      // End Logging Session
       if (sessionIdRef.current) {
           await loggingService.endSession(sessionIdRef.current, calculateCost(), liveAudioSeconds);
           sessionIdRef.current = null;
@@ -329,7 +308,7 @@ const App: React.FC = () => {
           visualizerStreamRef.current = null;
       }
       
-      if (audioContextRef.current) {
+      if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
           await audioContextRef.current.close();
           audioContextRef.current = null;
       }
@@ -355,7 +334,6 @@ const App: React.FC = () => {
       }
   };
 
-  // Check if API Key is configured (simplistic check)
   const isApiKeyConfigured = Boolean(process.env.API_KEY);
 
   return (
