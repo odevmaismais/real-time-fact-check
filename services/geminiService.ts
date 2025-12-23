@@ -16,6 +16,7 @@ const cleanTranscriptText = (text: string): string => {
   return text.replace(/\s+/g, ' ').trim();
 };
 
+// Downsample simples e robusto (48k -> 16k)
 function downsampleTo16k(input: Float32Array, inputRate: number): Int16Array {
     if (inputRate === 16000) {
         return floatTo16BitPCM(input);
@@ -150,7 +151,7 @@ export const connectToLiveDebate = async (
   
   const ai = new GoogleGenAI({ apiKey });
   
-  // Setup AudioContext
+  // Audio Context e Hacks para manter ativo
   const audioContext = new AudioContext(); 
   if (audioContext.state === 'suspended') await audioContext.resume();
 
@@ -185,8 +186,7 @@ export const connectToLiveDebate = async (
     activeSession = await ai.live.connect({
       model: LIVE_MODEL_NAME,
       config: {
-        // [FIX] TEXT é mais seguro para transcrição pura. 
-        // Se usar AUDIO, o modelo tenta falar. Se usar TEXT, ele foca em inputTranscription.
+        // [FIX] Usar TEXT para evitar que o modelo tente "falar" de volta
         responseModalities: [Modality.TEXT], 
         
         // Ativa transcrição
@@ -194,7 +194,7 @@ export const connectToLiveDebate = async (
         inputAudioTranscription: {}, 
         
         systemInstruction: {
-            parts: [{ text: "You are a transcription system. Transcribe the audio exactly in Portuguese. Do not translate. Do not answer." }]
+            parts: [{ text: "You are a transcription system. Transcribe the audio exactly in Portuguese. Do not translate. Do not answer questions." }]
         }
       },
       callbacks: {
@@ -208,7 +208,7 @@ export const connectToLiveDebate = async (
            const t2 = msg.serverContent?.modelTurn?.parts?.[0]?.text;
            
            if (t1) handleText(t1);
-           if (t2) handleText(t2); // Backup caso a IA responda em vez de transcrever
+           if (t2) handleText(t2);
            
            if (msg.serverContent?.turnComplete && currentBuffer) {
                onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: true });
@@ -237,19 +237,22 @@ export const connectToLiveDebate = async (
       // Monitor de Volume
       let sum = 0;
       for(let i=0; i<100; i++) sum += Math.abs(inputData[i]);
-      if(sum < 0.001 && Math.random() < 0.01) console.log("⚠️ Input Silencioso");
+      // Log esporádico para confirmar que o áudio chega aqui
+      if(sum > 0.001 && Math.random() < 0.01) console.log("📊 Audio chegando no processador...");
 
       try {
           const pcm16k = downsampleTo16k(inputData, streamRate);
           const base64Data = arrayBufferToBase64(pcm16k.buffer as ArrayBuffer);
 
-          // [CORREÇÃO] Envio direto, sem 'sessionPromise' (que não existe)
+          // [CORREÇÃO CRÍTICA] Envio direto!
+          // REMOVIDO: activeSession.sessionPromise.then(...)
           await activeSession.sendRealtimeInput([{ 
               mimeType: "audio/pcm;rate=16000",
               data: base64Data
           }]);
       } catch (err) {
-          console.error("Erro envio áudio (ignorável):", err);
+          // Log leve para não spamar
+          // console.error(err); 
       }
     };
 
