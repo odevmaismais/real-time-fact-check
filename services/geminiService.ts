@@ -84,7 +84,7 @@ export const analyzeStatement = async (
     });
 
     // [FIX] Use property access (.text) instead of method call (.text())
-    const jsonText = response.text || "";
+    const jsonText = response.text;
     
     if (!jsonText) throw new Error("No response from AI");
     
