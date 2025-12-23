@@ -16,7 +16,6 @@ const cleanTranscriptText = (text: string): string => {
   return text.replace(/\s+/g, ' ').trim();
 };
 
-// Reintroduzindo Downsampling robusto para garantir compatibilidade com a API (16kHz PCM)
 function downsampleTo16k(input: Float32Array, inputRate: number): Int16Array {
     if (inputRate === 16000) {
         return floatTo16BitPCM(input);
@@ -28,7 +27,6 @@ function downsampleTo16k(input: Float32Array, inputRate: number): Int16Array {
     for (let i = 0; i < newLength; i++) {
         const offset = Math.floor(i * ratio);
         const val = input[Math.min(offset, input.length - 1)];
-        // Clamp manual para evitar distorção (clipping)
         const s = Math.max(-1, Math.min(1, val));
         output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
     }
@@ -159,8 +157,6 @@ export const connectToLiveDebate = async (
   const source = audioContext.createMediaStreamSource(stream);
   const processor = audioContext.createScriptProcessor(4096, 1, 1);
   
-  // Gain node nulo para manter o pipeline ativo sem eco local (hack para Chrome/Edge)
-  // Isso força o navegador a processar o áudio sem tocar nas caixas de som do usuário
   const gain = audioContext.createGain();
   gain.gain.value = 0; 
   
@@ -171,7 +167,7 @@ export const connectToLiveDebate = async (
   const handleText = (raw: string) => {
       const text = cleanTranscriptText(raw);
       if (text.length > 0) {
-          // console.log("📝 RECEBIDO:", text); // Debug limpo
+          console.log("📝 TRANSCRITO:", text);
           currentBuffer += " " + text;
           onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: false });
           
@@ -189,20 +185,16 @@ export const connectToLiveDebate = async (
     activeSession = await ai.live.connect({
       model: LIVE_MODEL_NAME,
       config: {
-        // [CRÍTICO] A API Live EXIGE Modality.AUDIO para manter a conexão websocket aberta.
-        responseModalities: [Modality.AUDIO], 
+        // [FIX] TEXT é mais seguro para transcrição pura. 
+        // Se usar AUDIO, o modelo tenta falar. Se usar TEXT, ele foca em inputTranscription.
+        responseModalities: [Modality.TEXT], 
         
-        speechConfig: {
-            voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
-        },
-        
-        // CORREÇÃO CRÍTICA:
-        // A API Live rejeita 'languageCode' com erro 1007. 
-        // Devemos passar objeto vazio para ativar a transcrição e confiar no systemInstruction.
+        // Ativa transcrição
+        // @ts-ignore
         inputAudioTranscription: {}, 
         
         systemInstruction: {
-            parts: [{ text: "Você é um sistema de transcrição. Sua função é ouvir o áudio em Português do Brasil e gerar o texto correspondente (inputTranscription). Não responda ao usuário. Apenas transcreva o que ouvir." }]
+            parts: [{ text: "You are a transcription system. Transcribe the audio exactly in Portuguese. Do not translate. Do not answer." }]
         }
       },
       callbacks: {
@@ -212,10 +204,11 @@ export const connectToLiveDebate = async (
            onStatus?.({ type: 'info', message: "ESCUTANDO..." });
         },
         onmessage: (msg: LiveServerMessage) => {
-           // A transcrição do que estamos enviando vem em 'inputTranscription'
            const t1 = msg.serverContent?.inputTranscription?.text;
+           const t2 = msg.serverContent?.modelTurn?.parts?.[0]?.text;
            
            if (t1) handleText(t1);
+           if (t2) handleText(t2); // Backup caso a IA responda em vez de transcrever
            
            if (msg.serverContent?.turnComplete && currentBuffer) {
                onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: true });
@@ -241,36 +234,26 @@ export const connectToLiveDebate = async (
 
       const inputData = e.inputBuffer.getChannelData(0);
       
-      // Monitor de Volume (RMS) para debug
-      let sumSquares = 0;
-      for (let i = 0; i < inputData.length; i++) {
-        sumSquares += inputData[i] * inputData[i];
-      }
-      const rms = Math.sqrt(sumSquares / inputData.length);
-      
-      // Se estiver muito silencioso por muito tempo, alerta no console
-      if (rms < 0.001 && Math.random() < 0.005) {
-          console.warn("⚠️ Áudio muito baixo ou silêncio detectado no stream de entrada.");
-      }
+      // Monitor de Volume
+      let sum = 0;
+      for(let i=0; i<100; i++) sum += Math.abs(inputData[i]);
+      if(sum < 0.001 && Math.random() < 0.01) console.log("⚠️ Input Silencioso");
 
       try {
-          // Downsample para 16kHz para estabilidade da API
           const pcm16k = downsampleTo16k(inputData, streamRate);
           const base64Data = arrayBufferToBase64(pcm16k.buffer as ArrayBuffer);
 
-          activeSession.sessionPromise.then(async () => {
-             await activeSession.sendRealtimeInput([{ 
-                  mimeType: "audio/pcm;rate=16000",
-                  data: base64Data
-              }]);
-          });
+          // [CORREÇÃO] Envio direto, sem 'sessionPromise' (que não existe)
+          await activeSession.sendRealtimeInput([{ 
+              mimeType: "audio/pcm;rate=16000",
+              data: base64Data
+          }]);
       } catch (err) {
-          // Ignora erros de envio momentâneos (ex: rede oscilando)
+          console.error("Erro envio áudio (ignorável):", err);
       }
     };
 
     source.connect(processor);
-    // Truque para manter o ScriptProcessor ativo no Chrome: conectar ao destino (mas com volume 0)
     processor.connect(gain);
     gain.connect(audioContext.destination);
 
