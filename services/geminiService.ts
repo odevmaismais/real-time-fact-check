@@ -47,7 +47,7 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
     let binary = '';
     const bytes = new Uint8Array(buffer);
     const len = bytes.byteLength;
-    const chunkSize = 0x8000; // Processar em chunks para evitar stack overflow em grandes buffers
+    const chunkSize = 0x8000; 
     
     for (let i = 0; i < len; i += chunkSize) {
         const chunk = bytes.subarray(i, Math.min(i + chunkSize, len));
@@ -183,11 +183,19 @@ export const connectToLiveDebate = async (
     activeSession = await ai.live.connect({
       model: LIVE_MODEL_NAME,
       config: {
-        responseModalities: [Modality.TEXT], 
-        // @ts-ignore
-        inputAudioTranscription: { languageCode: "pt-BR" }, 
+        // [CRÍTICO] A API Live EXIGE Modality.AUDIO para manter a conexão aberta.
+        // Se colocar TEXT, ela fecha com Code 1000.
+        responseModalities: [Modality.AUDIO], 
+        
+        speechConfig: {
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
+        },
+        
+        // Habilita a transcrição do que entra (o debate)
+        inputAudioTranscription: {}, 
+        
         systemInstruction: {
-            parts: [{ text: "Você é um sistema de transcrição em tempo real. Sua ÚNICA função é transcrever o áudio recebido para texto em Português, continuamente. Não responda ao conteúdo, apenas transcreva." }]
+            parts: [{ text: "Você é um sistema de escuta passiva. Sua função é receber o áudio e gerar as transcrições de entrada. NÃO FALE. NÃO RESPONDA EM ÁUDIO. Mantenha-se em silêncio absoluto." }]
         }
       },
       callbacks: {
@@ -195,16 +203,14 @@ export const connectToLiveDebate = async (
            console.log("🟢 Conectado ao Gemini Live!");
            isConnected = true;
            onStatus?.({ type: 'info', message: "ESCUTANDO..." });
-           // REMOVIDO: activeSession.send(...) 
-           // Enviar mensagem de texto aqui faz o modelo responder e fechar o turno (Code 1000).
-           // Deixamos apenas o fluxo de áudio iniciar a interação.
         },
         onmessage: (msg: LiveServerMessage) => {
+           // O texto que queremos está em inputTranscription (o que o usuário falou/debate)
            const t1 = msg.serverContent?.inputTranscription?.text;
-           const t2 = msg.serverContent?.modelTurn?.parts?.[0]?.text;
+           
+           // Ignoramos modelTurn (o que o modelo falaria), pois pedimos silêncio.
            
            if (t1) handleText(t1);
-           if (t2) handleText(t2);
            
            if (msg.serverContent?.turnComplete && currentBuffer) {
                onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: true });
@@ -232,14 +238,16 @@ export const connectToLiveDebate = async (
       
       try {
           const pcm16k = downsampleTo16k(inputData, streamRate);
+          // Converter buffer para base64 com cast explícito para evitar erro de tipo do TS
           const base64Data = arrayBufferToBase64(pcm16k.buffer as ArrayBuffer);
 
+          // Usa sessionPromise implícito do activeSession
           await activeSession.sendRealtimeInput([{ 
               mimeType: "audio/pcm;rate=16000",
               data: base64Data
           }]);
       } catch (err) {
-          // Erros silenciosos de envio (comuns se a conexão cair milissegundos antes)
+          // Ignora erros de envio momentâneos
       }
     };
 
