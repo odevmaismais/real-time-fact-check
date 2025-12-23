@@ -191,7 +191,7 @@ export const connectToLiveDebate = async (
 
   const ai = new GoogleGenAI({ apiKey });
   
-  // [CORRECTION 1] Removed fixed sampleRate to allow native hardware rate
+  // [CORRECTION 1] Removed fixed sampleRate to allow native hardware rate (e.g. 44.1k/48k)
   const audioContext = new AudioContext(); 
   
   // [DEBUG] Log the actual rate being used
@@ -243,13 +243,12 @@ export const connectToLiveDebate = async (
     activeSession = await ai.live.connect({
       model: LIVE_MODEL_NAME,
       config: {
-        // [CORRECTION 3] Changed to TEXT modality
+        // [CORRECTION 2] Keep TEXT modality as requested
         responseModalities: [Modality.TEXT], 
         speechConfig: {
           voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
         },
-        // [CORRECTION 4] Explicitly setting model for input transcription
-        inputAudioTranscription: { model: LIVE_MODEL_NAME }, 
+        // [CORRECTION 3] REMOVED inputAudioTranscription entirely to fix Error 1007 (Invalid JSON)
         systemInstruction: "Role: Portuguese (Brazil) Transcriber. Context: Political debate. Rules: Transcribe spoken Portuguese exactly. IGNORE background noise. DO NOT output credits."
       },
       callbacks: {
@@ -259,26 +258,31 @@ export const connectToLiveDebate = async (
            onStatus?.({ type: 'info', message: "LIVE LINK ESTABLISHED" });
         },
         onmessage: (msg: LiveServerMessage) => {
-           // Debuging raw message to ensure we are getting transcription
+           // Debuging raw message
            // console.log("Msg:", msg);
 
-           const inputTrx = msg.serverContent?.inputTranscription;
+           // Note: Since inputAudioTranscription is removed, we rely on the model 
+           // generating text in its turn based on the system instruction.
+           // However, standard `serverContent.modelTurn` is usually the response.
            
-           if (inputTrx?.text) {
-               let text = inputTrx.text;
-               // console.log("Stream:", text);
-               
-               if (isGarbage(text)) return;
-               
-               text = cleanTranscriptText(text);
-               currentVolatileBuffer += text;
+           const textParts = msg.serverContent?.modelTurn?.parts;
+           if (textParts) {
+               for (const part of textParts) {
+                   if (part.text) {
+                       let text = part.text;
+                       if (isGarbage(text)) continue;
+                       
+                       text = cleanTranscriptText(text);
+                       currentVolatileBuffer += text;
 
-               // Send 'ghost' update for UI
-               try {
-                   onTranscript({ text: currentVolatileBuffer, speaker: DEFAULT_SPEAKER, isFinal: false });
-               } catch (e) { }
-               
-               scheduleSilenceCommit();
+                       // Send 'ghost' update for UI
+                       try {
+                           onTranscript({ text: currentVolatileBuffer, speaker: DEFAULT_SPEAKER, isFinal: false });
+                       } catch (e) { }
+                       
+                       scheduleSilenceCommit();
+                   }
+               }
            }
 
            if (msg.serverContent?.turnComplete) {
@@ -328,7 +332,7 @@ export const connectToLiveDebate = async (
           pendingAudioRequests++;
           await activeSession.sendRealtimeInput([{ 
               media: {
-                  // [CORRECTION 2] Dynamic Sample Rate
+                  // [CORRECTION 4] Dynamic Sample Rate to match AudioContext
                   mimeType: `audio/pcm;rate=${audioContext.sampleRate}`,
                   data: pcmData
               }
