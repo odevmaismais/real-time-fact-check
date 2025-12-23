@@ -65,6 +65,7 @@ export const analyzeStatement = async (
   contextHistory: string[] = [] 
 ): Promise<AnalysisResult> => {
   const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY;
+  if (!apiKey) throw new Error("API Key is missing");
   const ai = new GoogleGenAI({ apiKey });
   
   try {
@@ -85,7 +86,18 @@ export const analyzeStatement = async (
       },
     });
 
-    const jsonText = response.text || "{}"; 
+    // CORREÇÃO: Propriedade .text (sem parenteses)
+    const jsonText = response.text; 
+    
+    if (!jsonText) return {
+      segmentId,
+      verdict: VerdictType.UNVERIFIABLE,
+      confidence: 0,
+      explanation: "Sem resposta da IA",
+      sources: [],
+      sentimentScore: 0,
+    };
+
     const data = JSON.parse(jsonText);
     const sources = response.candidates?.[0]?.groundingMetadata?.groundingChunks
       ?.map((chunk: any) => chunk.web)
@@ -131,6 +143,12 @@ export const connectToLiveDebate = async (
   onStatus?: (status: LiveStatus) => void
 ): Promise<LiveConnectionController> => {
   const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY;
+  if (!apiKey) {
+    const e = new Error("API Key missing");
+    onError(e);
+    return { disconnect: async () => {}, flush: () => {} };
+  }
+  
   const ai = new GoogleGenAI({ apiKey });
   
   // Tenta criar contexto em 16kHz (o navegador pode ou não aceitar)
@@ -219,13 +237,14 @@ export const connectToLiveDebate = async (
       if(sum < 0.01 && Math.random() < 0.01) console.log("⚠️ Silêncio detectado (Check a aba do YT)");
 
       try {
-          // DOWNAMPLING OBRIGATÓRIO PARA 16kHz
-          // O Gemini AMA 16kHz e ODEIA 48kHz para reconhecimento de fala
+          // DOWNSAMPLING OBRIGATÓRIO PARA 16kHz
           const pcm16k = downsampleTo16k(inputData, streamRate);
-          const base64Data = arrayBufferToBase64(pcm16k.buffer);
+          
+          // CORREÇÃO CRÍTICA DE BUILD: Cast para ArrayBuffer
+          const base64Data = arrayBufferToBase64(pcm16k.buffer as ArrayBuffer);
 
           await activeSession.sendRealtimeInput([{ 
-              mimeType: "audio/pcm;rate=16000", // Agora é verdade!
+              mimeType: "audio/pcm;rate=16000",
               data: base64Data
           }]);
       } catch (err) {
