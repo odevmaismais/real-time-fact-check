@@ -42,33 +42,18 @@ const cleanTranscriptText = (text: string): string => {
 
 // --- AUDIO PROCESSING ---
 
-// Downsample buffer to 16kHz (Required by Gemini Live API for optimal results)
-const downsampleTo16k = (buffer: Float32Array, sampleRate: number): Int16Array => {
-  if (sampleRate === 16000) {
-    // Direct conversion if already 16k (unlikely in browser)
-    const output = new Int16Array(buffer.length);
-    for (let i = 0; i < buffer.length; i++) {
-        const s = Math.max(-1, Math.min(1, buffer[i]));
+// Convert Float32 (Web Audio) to Int16 (PCM) 1:1 without downsampling
+// This preserves the native sample rate quality
+const floatTo16BitPCM = (input: Float32Array): Int16Array => {
+    const output = new Int16Array(input.length);
+    for (let i = 0; i < input.length; i++) {
+        const s = Math.max(-1, Math.min(1, input[i]));
         output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
     }
     return output;
-  }
-  
-  const compression = sampleRate / 16000;
-  const length = Math.floor(buffer.length / compression);
-  const result = new Int16Array(length);
+};
 
-  for (let i = 0; i < length; i++) {
-    // Simple decimation (can be improved with averaging but this is fast/sufficient for speech)
-    const inputIndex = Math.floor(i * compression);
-    // Clamp values
-    const s = Math.max(-1, Math.min(1, buffer[inputIndex]));
-    // Convert to 16-bit PCM
-    result[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-  }
-  return result;
-}
-
+// [FIX] TS2345: Accept ArrayBufferLike to support SharedArrayBuffer if needed
 function arrayBufferToBase64(buffer: ArrayBufferLike) {
   let binary = '';
   const bytes = new Uint8Array(buffer);
@@ -212,9 +197,10 @@ export const connectToLiveDebate = async (
 
   const ai = new GoogleGenAI({ apiKey });
   
-  // 1. Initialize AudioContext at NATIVE rate (e.g. 48000) to avoid hardware crash
+  // [CRITICAL] 1. Use Native AudioContext (no specific sample rate)
   const audioContext = new AudioContext(); 
-  console.log("Audio Context Rate:", audioContext.sampleRate);
+  const currentSampleRate = audioContext.sampleRate;
+  console.log("Audio Context Rate:", currentSampleRate);
 
   if (audioContext.state === 'suspended') {
     await audioContext.resume();
@@ -260,22 +246,20 @@ export const connectToLiveDebate = async (
     activeSession = await ai.live.connect({
       model: LIVE_MODEL_NAME,
       config: {
+        // [CRITICAL] 2. Maintain Modality.TEXT
         responseModalities: [Modality.TEXT], 
-        speechConfig: {
-          voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
-        },
-        // [STRATEGY] Removed inputAudioTranscription to avoid Error 1007.
-        // We rely on the System Prompt to force the model to ACT as a transcriber.
-        systemInstruction: "You are a professional real-time Speech-to-Text transcriber for a Portuguese political debate. Your ONLY task is to output the exact Portuguese transcription of the audio stream continuously. Do NOT answer questions. Do NOT summarize. Just output the words spoken. If the audio is silence or noise, output nothing."
+        // [FIX] Removed speechConfig (not needed for text output)
+        // [FIX] Removed inputAudioTranscription (caused Error 1007)
+        systemInstruction: "You are a live transcriber. Your job is to listen to the audio stream and output the Portuguese text EXACTLY as spoken. Do not summarize. Do not answer. Just write down the words immediately. If there is silence, output nothing."
       },
       callbacks: {
         onopen: () => {
-           console.log("🟢 Gemini Live Connected (" + LIVE_MODEL_NAME + ")");
+           console.log("🟢 Gemini Live Connected (" + LIVE_MODEL_NAME + ") Rate: " + currentSampleRate);
            isConnected = true;
            onStatus?.({ type: 'info', message: "LIVE LINK ESTABLISHED" });
         },
         onmessage: (msg: LiveServerMessage) => {
-           // We look for text in the model's turn (since we asked it to be a transcriber)
+           // With inputAudioTranscription removed, we rely on the model 'replying' with the text
            const textParts = msg.serverContent?.modelTurn?.parts;
            if (textParts) {
                for (const part of textParts) {
@@ -331,16 +315,17 @@ export const connectToLiveDebate = async (
           silenceChunkCount = 0;
       }
 
-      // [CRITICAL FIX] Downsample to 16kHz
-      const pcm16k = downsampleTo16k(inputData, audioContext.sampleRate);
-      const base64Data = arrayBufferToBase64(pcm16k.buffer);
+      // [CRITICAL] 3. Native Sample Rate Processing
+      // Convert Float32 to Int16 directly (1:1 mapping, no downsampling)
+      const pcmData = floatTo16BitPCM(inputData);
+      const base64Data = arrayBufferToBase64(pcmData.buffer);
       
       try {
           pendingAudioRequests++;
           await activeSession.sendRealtimeInput([{ 
               media: {
-                  // Explicitly tell API we are sending 16kHz
-                  mimeType: "audio/pcm;rate=16000",
+                  // [CRITICAL] Dynamic Sample Rate in MimeType
+                  mimeType: `audio/pcm;rate=${currentSampleRate}`,
                   data: base64Data
               }
           }]);
