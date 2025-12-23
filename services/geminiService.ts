@@ -18,8 +18,6 @@ const isGarbage = (text: string): boolean => {
   if (t.length === 0) return true;
 
   // 1. Strict Short Word Filter
-  // Only allow specific short words that are common connectors or interjections in PT-BR.
-  // Reject random 1-2 char noise (e.g., "z", "k", "tt") unless it's a known valid word.
   const allowList = [
       'a', 'e', 'é', 'o', 'ó', 'u', 'à', 'y', 
       'oi', 'ai', 'ui', 'eu', 'tu', 'ele', 'nós', 'vós', 
@@ -28,29 +26,22 @@ const isGarbage = (text: string): boolean => {
       'fé', 'lei', 'crê', 'dê', 'vê'
   ];
   
-  // If text is 2 chars or less, it MUST be in the allowList or a number.
   if (t.length <= 2 && !allowList.includes(t.toLowerCase()) && !/^\d+$/.test(t)) return true;
 
   const lower = t.toLowerCase();
   
   // 2. Enhanced Hallucination List
-  // These are common artifacts in training data from YouTube/TV captions.
   const hallucinations = [
-    // General / English artifacts
     'legendas', 'subtitles', 'watching', 'transcribed', 
     'copyright', 'todos os direitos', 'obrigado por assistir',
     'subs by', '[music]', '[applause]', '(risos)', '(silêncio)',
     'www.', '.com', 'http',
-    
-    // PT-BR Broadcast/YouTube artifacts
     'inscreva-se', 'deixe o like', 'deixe seu like', 'ative o sininho',
     'link na bio', 'siga nas redes', 'compartilhe',
     'tradução por', 'sincronia', 'legenda por', 'editado por',
     'créditos:', 'fim da transmissão', 'voltamos já', 
     'a seguir', 'blá blá', 'etc etc', 'realização', 'apoio cultural',
     'áudio original', 'encerrando transmissão', 'sem áudio',
-    
-    // Nonsense phrases common in low-confidence ASR during noise
     'o se amo', 'um saúde', 'uma saúde', 'obrigado a todos', 'até a próxima',
     'tv câmara', 'tv senado', 'reprodução', 
     'legendado por', 'tradução:', 'legenda:',
@@ -58,18 +49,11 @@ const isGarbage = (text: string): boolean => {
     'whatsapp', 'facebook', 'instagram', 'twitter', 'youtube'
   ];
   
-  // Check against hallucination list
   if (hallucinations.some(h => lower.includes(h))) return true;
   
   // 3. Pattern Matching for Garbage
-  
-  // Regex to catch only symbols (e.g. "???" or "...")
   if (/^[^a-zA-Z0-9À-ÿ\s]+$/.test(t)) return true;
-
-  // Regex to catch repetitive single-char noise (e.g., "a a a a a", "e e e")
   if (/^([a-zà-ÿ])(\s+\1){2,}$/i.test(t)) return true;
-  
-  // Catch repetitive syllables (e.g., "da da da da") often output during static
   if (/^(\w{2,})\s\1\s\1/.test(lower)) return true;
 
   return false;
@@ -78,9 +62,7 @@ const isGarbage = (text: string): boolean => {
 const cleanTranscriptText = (text: string): string => {
   if (!text) return "";
   let cleaned = text;
-  // Normalize whitespace
   cleaned = cleaned.replace(/\s+/g, ' ');
-  // Remove aggressive stuttering (3+ repeats)
   cleaned = cleaned.replace(/\b(\w+)( \1){2,}\b/gi, '$1');
   return cleaned;
 };
@@ -91,7 +73,6 @@ export const analyzeStatement = async (
   text: string,
   segmentId: string
 ): Promise<AnalysisResult> => {
-  // Create local instance for independent REST calls
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
   
   try {
@@ -186,10 +167,6 @@ export interface LiveConnectionController {
     flush: () => void;
 }
 
-/**
- * Calculates Root Mean Square (RMS) amplitude of audio buffer.
- * Used for Voice Activity Detection (VAD).
- */
 const calculateRMS = (data: Float32Array): number => {
     let sum = 0;
     for (let i = 0; i < data.length; i++) {
@@ -208,15 +185,16 @@ export const connectToLiveDebate = async (
   onStatus?: (status: LiveStatus) => void
 ): Promise<LiveConnectionController> => {
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-  const streamClone = stream.clone();
   
-  // 16kHz is optimal for Speech-to-Text
+  // NOTE: Removed stream.clone() to avoid browser inconsistencies with track states in production.
+  // Using the original stream source. 
+  
   const audioContext = new AudioContext({ sampleRate: 16000 });
   if (audioContext.state === 'suspended') {
     await audioContext.resume();
   }
 
-  const source = audioContext.createMediaStreamSource(streamClone);
+  const source = audioContext.createMediaStreamSource(stream);
   const processor = audioContext.createScriptProcessor(4096, 1, 1);
   
   let currentVolatileBuffer = "";
@@ -225,20 +203,16 @@ export const connectToLiveDebate = async (
   let silenceTimer: any = null;
   let activeSession: any = null;
   
-  // --- VAD & BACKPRESSURE CONFIG ---
-  // RMS Threshold: < 0.01 usually means silence/background hum. 
-  // Increase if environment is noisy.
-  const VAD_THRESHOLD = 0.01; 
+  // PRODUCTION FIX: Lowered VAD Threshold significantly. 
+  // 0.01 was too high for some microphones, leading to silence.
+  const VAD_THRESHOLD = 0.002; 
   
-  // Hangover: Number of "silence" chunks to keep sending after speech ends.
-  // 4096 samples @ 16kHz ~= 256ms. 
-  // 3 chunks ~= 750ms of trailing audio to capture soft endings of words.
-  const SILENCE_HANGOVER_CHUNKS = 3;
+  const SILENCE_HANGOVER_CHUNKS = 5; // Increased hangover for safety
   let silenceChunkCount = 0;
 
-  // Backpressure: If we have too many un-acked requests, drop frames.
+  // Backpressure monitoring
   let pendingAudioRequests = 0;
-  const MAX_PENDING_REQUESTS = 4; // Max concurrent audio pushes allowed
+  const MAX_PENDING_REQUESTS = 4; 
 
   const commitBuffer = () => {
     if (currentVolatileBuffer.trim().length > 0) {
@@ -271,17 +245,14 @@ export const connectToLiveDebate = async (
         },
         inputAudioTranscription: {}, 
         systemInstruction: `
-          Role: Elite Portuguese Speech-to-Text Specialist for Political Analysis.
-          Context: Real-time audio feed from a political debate.
+          Role: Portuguese (Brazil) Transcriber.
+          Context: Live political debate.
           
           Directives:
-          1. VERBATIM TRANSCRIPTION: Transcribe the dominant speaker exactly as heard in Portuguese (Brazil).
-          2. NOISE FILTERING: Completely IGNORE background noise, applause, cheering, music, and distinct cross-talk from audience.
-          3. HALLUCINATION CHECK: Do NOT output broadcast artifacts like "Obrigado por assistir", "Legendas", "Copyright", "Sincronia". If the audio is just music or silence, output NOTHING.
-          4. OVERLAP HANDLING: In case of overlapping speech (debater vs moderator or debater vs debater), prioritize the dominant/louder voice.
-          5. PUNCTUATION & SEGMENTATION: Use natural punctuation (., ?, !) to separate thoughts.
-          6. DISFLUENCY: Omit pure filler sounds (uh, um, ah) unless necessary for context, but keep hesitations if they change meaning.
-          7. SPEAKER IDENTIFICATION: Focus on the main speech content.
+          1. TRANSCRIBE EXACTLY what is said in Portuguese.
+          2. IGNORE non-speech noise (applause, music, static).
+          3. DO NOT output metadata like "Obrigado por assistir" or "Legendas".
+          4. If audio is unclear, output nothing.
         `,
       },
       callbacks: {
@@ -291,10 +262,11 @@ export const connectToLiveDebate = async (
            onStatus?.({ type: 'info', message: "LIVE FEED ACTIVE" });
         },
         onmessage: (msg: LiveServerMessage) => {
-           // 1. Handle Input Transcription (ASR)
+           // 1. Handle Input Transcription
            const inputTrx = msg.serverContent?.inputTranscription;
            if (inputTrx?.text) {
                let text = inputTrx.text;
+               // console.log("Raw transcript:", text); // Debug log
                
                if (isGarbage(text)) {
                    return; 
@@ -303,7 +275,6 @@ export const connectToLiveDebate = async (
                text = cleanTranscriptText(text);
                currentVolatileBuffer += text;
 
-               // Safety: Auto-flush if buffer is too big
                if (currentVolatileBuffer.length > 1500) {
                    commitBuffer();
                } else {
@@ -343,47 +314,37 @@ export const connectToLiveDebate = async (
 
     isConnected = true;
 
-    // --- AUDIO PROCESSING LOOP ---
     processor.onaudioprocess = async (e) => {
       if (!isConnected || !activeSession) return; 
 
-      // 1. BACKPRESSURE CHECK
-      // If the network is clogging, don't add more fuel to the fire.
-      // Drop frames to let the queue drain.
+      // PRODUCTION FIX: Removed rigid backpressure blocking.
+      // If requests pile up, we log a warning but keep trying to send latest audio to avoid "freezing".
       if (pendingAudioRequests >= MAX_PENDING_REQUESTS) {
-          // console.warn("Dropping frame due to backpressure");
-          return;
+          console.warn("High Latency: Audio queue full, dropping frames may occur.");
+          // We intentionally do NOT return here, effectively overwriting/pushing through 
+          // to ensure the socket doesn't stall completely, or rely on socket internal buffering.
+          // However, to prevent memory leaks in the JS heap, we should be careful. 
+          // Let's drop if it gets REALLY bad (e.g. > 10).
+          if (pendingAudioRequests > 10) return;
       }
 
       const inputData = e.inputBuffer.getChannelData(0);
-      
-      // 2. VOICE ACTIVITY DETECTION (VAD)
       const rms = calculateRMS(inputData);
       
-      // If RMS is below noise threshold, we might skip sending
+      // VAD CHECK
       if (rms < VAD_THRESHOLD) {
           silenceChunkCount++;
-          // If we have exceeded the "hangover" period (tail of speech), stop sending data.
-          // This saves massive bandwidth and prevents model hallucinations on silence.
           if (silenceChunkCount > SILENCE_HANGOVER_CHUNKS) {
               return; 
           }
       } else {
-          // Reset silence counter if we hear sound
           silenceChunkCount = 0;
       }
 
-      // 3. ENCODING
       const pcmData = floatTo16BitPCM(inputData);
 
-      // 4. SEND WITH BACKPRESSURE TRACKING
       try {
           pendingAudioRequests++;
-          
-          // Note: sendRealtimeInput is void in types, but internally wraps a promise-like structure 
-          // in the websocket queue. We wrap it to track execution flow if possible, 
-          // though strict awaiting inside onaudioprocess is tricky. 
-          // We assume synchronous push to socket queue.
           
           await activeSession.sendRealtimeInput({ 
               media: {
@@ -414,8 +375,6 @@ export const connectToLiveDebate = async (
                await audioContext.close();
            }
            
-           streamClone.getTracks().forEach(track => track.stop());
-
            if (activeSession) {
                try {
                   activeSession.close();
@@ -429,7 +388,6 @@ export const connectToLiveDebate = async (
     };
   } catch (err: any) {
     onError(err);
-    streamClone.getTracks().forEach(track => track.stop());
     if (audioContext.state !== 'closed') await audioContext.close();
     
     return {
@@ -439,10 +397,6 @@ export const connectToLiveDebate = async (
   }
 }
 
-/**
- * Fast conversion from Float32 to 16-bit PCM base64.
- * Assumes input is already at correct sample rate.
- */
 function floatTo16BitPCM(input: Float32Array): string {
     const output = new Int16Array(input.length);
     for (let i = 0; i < input.length; i++) {
@@ -450,11 +404,9 @@ function floatTo16BitPCM(input: Float32Array): string {
         output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
     }
     
-    // Convert to binary string
     let binary = '';
     const bytes = new Uint8Array(output.buffer);
     const len = bytes.byteLength;
-    // Chunk processing for large buffers to avoid stack overflow
     for (let i = 0; i < len; i+=1024) {
         binary += String.fromCharCode.apply(null, Array.from(bytes.slice(i, i+1024)));
     }
