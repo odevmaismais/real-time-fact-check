@@ -69,7 +69,7 @@ const downsampleTo16k = (buffer: Float32Array, sampleRate: number): Int16Array =
   return result;
 }
 
-function arrayBufferToBase64(buffer: ArrayBuffer) {
+function arrayBufferToBase64(buffer: ArrayBufferLike) {
   let binary = '';
   const bytes = new Uint8Array(buffer);
   const len = bytes.byteLength;
