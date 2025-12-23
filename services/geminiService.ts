@@ -11,36 +11,52 @@ export type LiveStatus = {
 
 // --- UTILS ---
 
-const isGarbage = (text: string): boolean => {
-  if (!text) return true;
-  const t = text.trim();
-  if (t.length === 0) return true;
-  return false;
-};
-
 const cleanTranscriptText = (text: string): string => {
   if (!text) return "";
   return text.replace(/\s+/g, ' ').trim();
 };
 
-function floatTo16BitPCM(input: Float32Array): string {
+// Conversor com Downsampling (48k/44.1k -> 16k)
+function downsampleTo16k(input: Float32Array, inputRate: number): Int16Array {
+    if (inputRate === 16000) {
+        return floatTo16BitPCM(input);
+    }
+    const ratio = inputRate / 16000;
+    const newLength = Math.ceil(input.length / ratio);
+    const output = new Int16Array(newLength);
+    
+    for (let i = 0; i < newLength; i++) {
+        const offset = Math.floor(i * ratio);
+        // Proteção de limites
+        const val = input[Math.min(offset, input.length - 1)];
+        // Clamp e conversão
+        const s = Math.max(-1, Math.min(1, val));
+        output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+    return output;
+}
+
+function floatTo16BitPCM(input: Float32Array): Int16Array {
     const output = new Int16Array(input.length);
     for (let i = 0; i < input.length; i++) {
         const s = Math.max(-1, Math.min(1, input[i]));
         output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
     }
-    const bytes = new Uint8Array(output.buffer);
+    return output;
+}
+
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
     let binary = '';
+    const bytes = new Uint8Array(buffer);
     const len = bytes.byteLength;
-    const CHUNK_SIZE = 0x8000; 
-    for (let i = 0; i < len; i += CHUNK_SIZE) {
-        binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK_SIZE)));
+    for (let i = 0; i < len; i++) {
+        binary += String.fromCharCode(bytes[i]);
     }
     return btoa(binary);
 }
 
 // -------------------------------------------
-// FUNÇÃO DE ANÁLISE (FACT CHECKING)
+// FACT CHECKING
 // -------------------------------------------
 
 export const analyzeStatement = async (
@@ -52,20 +68,12 @@ export const analyzeStatement = async (
   const ai = new GoogleGenAI({ apiKey });
   
   try {
-    const contextBlock = contextHistory.length > 0 
-      ? `CONTEXTO ANTERIOR:\n${contextHistory.map((s, i) => `-${i+1}: "${s}"`).join('\n')}`
-      : "CONTEXTO: Início do debate";
-
     const prompt = `
-      CONTEXTO: Checagem de fatos em tempo real (Brasil).
-      ${contextBlock}
-      FRASE ALVO: "${text}"
-      
-      TAREFA:
-      1. Se for OPINIÃO/RETÓRICA -> verdict: "OPINION" (Não busque).
-      2. Se for FATO -> verdict: "TRUE"/"FALSE"/"MISLEADING" (Use googleSearch).
-      
-      Responda em JSON (pt-BR).
+      CONTEXTO: Checagem de fatos (Brasil).
+      CONTEXTO ANTERIOR: ${contextHistory.join(" | ")}
+      FRASE: "${text}"
+      TAREFA: Classificar e verificar.
+      Retorne JSON: { verdict: "TRUE"|"FALSE"|"MISLEADING"|"OPINION", explanation: "...", confidence: 0.9 }
     `;
 
     const response = await ai.models.generateContent({
@@ -90,8 +98,8 @@ export const analyzeStatement = async (
       explanation: data.explanation || "Sem análise",
       counterEvidence: data.counterEvidence,
       sources: sources,
-      sentimentScore: data.sentimentScore || 0,
-      logicalFallacies: data.logicalFallacies || [],
+      sentimentScore: 0,
+      logicalFallacies: [],
       context: contextHistory
     };
   } catch (error) {
@@ -100,7 +108,7 @@ export const analyzeStatement = async (
       segmentId,
       verdict: VerdictType.UNVERIFIABLE,
       confidence: 0,
-      explanation: "Erro técnico na verificação.",
+      explanation: "Erro técnico.",
       sources: [],
       sentimentScore: 0,
     };
@@ -108,7 +116,7 @@ export const analyzeStatement = async (
 };
 
 // -------------------------------------------
-// FUNÇÃO DE CONEXÃO LIVE
+// CONEXÃO LIVE (STREAMING)
 // -------------------------------------------
 
 export interface LiveConnectionController {
@@ -125,7 +133,9 @@ export const connectToLiveDebate = async (
   const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY;
   const ai = new GoogleGenAI({ apiKey });
   
-  const audioContext = new AudioContext(); 
+  // Tenta criar contexto em 16kHz (o navegador pode ou não aceitar)
+  // Se não aceitar, usamos o nativo e fazemos downsample manual.
+  const audioContext = new AudioContext({ sampleRate: 16000 }); 
   if (audioContext.state === 'suspended') await audioContext.resume();
 
   const source = audioContext.createMediaStreamSource(stream);
@@ -135,15 +145,14 @@ export const connectToLiveDebate = async (
   let isConnected = false;
   let activeSession: any = null;
 
-  const handleTextPart = (rawText: string) => {
-      const text = cleanTranscriptText(rawText);
-      if (!isGarbage(text)) {
-          console.log("📝 Texto Recebido:", text); // Debug visual
+  const handleText = (raw: string) => {
+      const text = cleanTranscriptText(raw);
+      if (text.length > 0) {
+          console.log("📝 RECEBIDO:", text);
           currentBuffer += " " + text;
           onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: false });
           
-          // Commit rápido para manter fluidez
-          if (currentBuffer.length > 100 || text.endsWith('.')) {
+          if (currentBuffer.length > 80 || text.match(/[.!?]$/)) {
               onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: true });
               currentBuffer = "";
           }
@@ -151,57 +160,48 @@ export const connectToLiveDebate = async (
   };
 
   try {
-    console.log(`🎤 Conectando Gemini Live (Rate: ${audioContext.sampleRate}Hz)`);
+    const streamRate = audioContext.sampleRate;
+    console.log(`🎤 Configurando Áudio: Input=${streamRate}Hz -> Output=16000Hz`);
 
     activeSession = await ai.live.connect({
       model: LIVE_MODEL_NAME,
       config: {
         responseModalities: [Modality.TEXT], 
         // @ts-ignore
-        inputAudioTranscription: {}, 
+        inputAudioTranscription: { languageCode: "pt-BR" }, 
         systemInstruction: {
-            parts: [{
-                text: "You are a transcriber. Output EXACTLY what is said in Portuguese. Do not translate. Do not summarize."
-            }]
+            parts: [{ text: "Transcreva o áudio para Português." }]
         }
       },
       callbacks: {
         onopen: () => {
-           console.log("🟢 Conectado!");
+           console.log("🟢 Conectado ao Gemini Live!");
            isConnected = true;
-           onStatus?.({ type: 'info', message: "CONEXÃO ESTABELECIDA" });
+           onStatus?.({ type: 'info', message: "ESCUTANDO..." });
+           // Envia mensagem inicial para 'acordar' a sessão
+           activeSession.send([{ text: "Iniciando transcrição." }]);
         },
         onmessage: (msg: LiveServerMessage) => {
-           // 1. Tenta pegar do Input Transcription (Eco do usuário)
-           const inputTrx = msg.serverContent?.inputTranscription;
-           if (inputTrx?.text) {
-               handleTextPart(inputTrx.text);
-           }
+           // Verifica todos os canais possíveis de texto
+           const t1 = msg.serverContent?.inputTranscription?.text;
+           const t2 = msg.serverContent?.modelTurn?.parts?.[0]?.text;
            
-           // 2. Tenta pegar do Model Turn (Resposta da IA atuando como transcritor)
-           // Isso resolve o problema se o 'inputTranscription' estiver mudo.
-           const modelTurn = msg.serverContent?.modelTurn;
-           if (modelTurn?.parts) {
-               for (const part of modelTurn.parts) {
-                   if (part.text) handleTextPart(part.text);
-               }
-           }
-
-           if (msg.serverContent?.turnComplete) {
-               if(currentBuffer.trim()) {
-                   onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: true });
-                   currentBuffer = "";
-               }
+           if (t1) handleText(t1);
+           if (t2) handleText(t2);
+           
+           if (msg.serverContent?.turnComplete && currentBuffer) {
+               onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: true });
+               currentBuffer = "";
            }
         },
         onclose: (e) => {
            console.log("🔴 Fechado:", e);
-           onStatus?.({ type: 'warning', message: "DESCONECTADO" });
+           if(isConnected) onStatus?.({ type: 'warning', message: "DESCONECTADO" });
            isConnected = false;
         },
         onerror: (err) => {
            console.error("🔴 Erro:", err);
-           onStatus?.({ type: 'error', message: "ERRO DE CONEXÃO" });
+           onStatus?.({ type: 'error', message: "ERRO DE STREAM" });
         }
       }
     });
@@ -210,21 +210,23 @@ export const connectToLiveDebate = async (
 
     processor.onaudioprocess = async (e) => {
       if (!isConnected || !activeSession) return; 
-      
+
       const inputData = e.inputBuffer.getChannelData(0);
       
-      // Monitor de Volume (Debug no Console)
-      // Se aparecerem apenas zeros, o Chrome não está pegando áudio da aba
-      let sum = 0;
-      for(let i=0; i<100; i++) sum += Math.abs(inputData[i]);
-      if (Math.random() < 0.05) console.log("📊 Vol:", (sum/100).toFixed(4)); 
+      // Monitor visual de volume
+      let sum = 0; 
+      for(let i=0;i<inputData.length;i+=100) sum+=Math.abs(inputData[i]);
+      if(sum < 0.01 && Math.random() < 0.01) console.log("⚠️ Silêncio detectado (Check a aba do YT)");
 
-      const pcmData = floatTo16BitPCM(inputData);
-      
       try {
+          // DOWNAMPLING OBRIGATÓRIO PARA 16kHz
+          // O Gemini AMA 16kHz e ODEIA 48kHz para reconhecimento de fala
+          const pcm16k = downsampleTo16k(inputData, streamRate);
+          const base64Data = arrayBufferToBase64(pcm16k.buffer);
+
           await activeSession.sendRealtimeInput([{ 
-              mimeType: `audio/pcm;rate=${audioContext.sampleRate}`,
-              data: pcmData
+              mimeType: "audio/pcm;rate=16000", // Agora é verdade!
+              data: base64Data
           }]);
       } catch (err) {
           console.error("Erro envio áudio", err);
