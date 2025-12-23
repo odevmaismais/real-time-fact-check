@@ -240,6 +240,14 @@ const App: React.FC = () => {
                     audio: true,
                     preferCurrentTab: false,
                 } as any);
+                
+                // CRÍTICO: Verificar se existe faixa de áudio
+                // Se o usuário esquecer de marcar "Compartilhar áudio da guia", isso será 0.
+                if (stream.getAudioTracks().length === 0) {
+                     alert("⚠️ ATENÇÃO: Nenhum áudio detectado!\n\nVocê precisa marcar a caixa 'Compartilhar áudio da guia' (ou 'Share tab audio') na janela de seleção do navegador.\n\nTente novamente.");
+                     stream.getTracks().forEach(t => t.stop());
+                     throw new Error("No audio track detected");
+                }
             }
         } catch (mediaErr: any) {
             if (mediaErr.name === 'NotAllowedError') {
@@ -282,8 +290,10 @@ const App: React.FC = () => {
         
         if (err.message === "Permission denied") {
              setLiveStatus({ type: 'error', message: "Microphone Access Denied" });
+        } else if (err.message === "No audio track detected") {
+             setLiveStatus({ type: 'error', message: "NO AUDIO SOURCE" });
         } else {
-             setLiveStatus({ type: 'error', message: "Failed to access audio source." });
+             setLiveStatus({ type: 'error', message: "Failed to access audio." });
         }
     }
   };
@@ -443,6 +453,7 @@ const App: React.FC = () => {
                     <div className="h-full flex flex-col items-center justify-center text-gray-600 opacity-50">
                         <Radio className="w-16 h-16 mb-4 animate-pulse" />
                         <p className="font-mono text-sm tracking-widest">AWAITING SIGNAL INPUT...</p>
+                        <p className="text-xs text-gray-700 mt-2 font-mono">Ensure "Share Tab Audio" is checked in browser dialog</p>
                     </div>
                 )}
                 

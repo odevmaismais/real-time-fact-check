@@ -16,7 +16,7 @@ const cleanTranscriptText = (text: string): string => {
   return text.replace(/\s+/g, ' ').trim();
 };
 
-// Conversor com Downsampling (48k/44.1k -> 16k)
+// Reintroduzindo Downsampling robusto para garantir compatibilidade com a API (16kHz PCM)
 function downsampleTo16k(input: Float32Array, inputRate: number): Int16Array {
     if (inputRate === 16000) {
         return floatTo16BitPCM(input);
@@ -28,6 +28,7 @@ function downsampleTo16k(input: Float32Array, inputRate: number): Int16Array {
     for (let i = 0; i < newLength; i++) {
         const offset = Math.floor(i * ratio);
         const val = input[Math.min(offset, input.length - 1)];
+        // Clamp manual para evitar distorção (clipping)
         const s = Math.max(-1, Math.min(1, val));
         output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
     }
@@ -151,12 +152,17 @@ export const connectToLiveDebate = async (
   
   const ai = new GoogleGenAI({ apiKey });
   
-  // Audio Context Setup
+  // Setup AudioContext
   const audioContext = new AudioContext(); 
   if (audioContext.state === 'suspended') await audioContext.resume();
 
   const source = audioContext.createMediaStreamSource(stream);
   const processor = audioContext.createScriptProcessor(4096, 1, 1);
+  
+  // Gain node nulo para manter o pipeline ativo sem eco local (hack para Chrome/Edge)
+  // Isso força o navegador a processar o áudio sem tocar nas caixas de som do usuário
+  const gain = audioContext.createGain();
+  gain.gain.value = 0; 
   
   let currentBuffer = "";
   let isConnected = false;
@@ -165,7 +171,7 @@ export const connectToLiveDebate = async (
   const handleText = (raw: string) => {
       const text = cleanTranscriptText(raw);
       if (text.length > 0) {
-          console.log("📝 RECEBIDO:", text);
+          // console.log("📝 RECEBIDO:", text); // Debug limpo
           currentBuffer += " " + text;
           onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: false });
           
@@ -183,19 +189,22 @@ export const connectToLiveDebate = async (
     activeSession = await ai.live.connect({
       model: LIVE_MODEL_NAME,
       config: {
-        // [CRÍTICO] A API Live EXIGE Modality.AUDIO para manter a conexão aberta.
-        // Se colocar TEXT, ela fecha com Code 1000.
+        // [CRÍTICO] A API Live EXIGE Modality.AUDIO para manter a conexão websocket aberta.
+        // Se usar TEXT, ela fecha o socket após a primeira resposta.
         responseModalities: [Modality.AUDIO], 
         
         speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
         },
         
-        // Habilita a transcrição do que entra (o debate)
-        inputAudioTranscription: {}, 
+        // Habilita transcrição de entrada em PT-BR
+        // @ts-ignore
+        inputAudioTranscription: { 
+            languageCode: "pt-BR" 
+        }, 
         
         systemInstruction: {
-            parts: [{ text: "Você é um sistema de escuta passiva. Sua função é receber o áudio e gerar as transcrições de entrada. NÃO FALE. NÃO RESPONDA EM ÁUDIO. Mantenha-se em silêncio absoluto." }]
+            parts: [{ text: "Você é um transcritor passivo de debates. Sua ÚNICA função é converter o áudio recebido em texto (transcrição). Mantenha silêncio absoluto no canal de áudio de saída. Apenas transcreva." }]
         }
       },
       callbacks: {
@@ -205,10 +214,8 @@ export const connectToLiveDebate = async (
            onStatus?.({ type: 'info', message: "ESCUTANDO..." });
         },
         onmessage: (msg: LiveServerMessage) => {
-           // O texto que queremos está em inputTranscription (o que o usuário falou/debate)
+           // A transcrição do que estamos enviando vem em 'inputTranscription'
            const t1 = msg.serverContent?.inputTranscription?.text;
-           
-           // Ignoramos modelTurn (o que o modelo falaria), pois pedimos silêncio.
            
            if (t1) handleText(t1);
            
@@ -219,7 +226,7 @@ export const connectToLiveDebate = async (
         },
         onclose: (e) => {
            console.log("🔴 Fechado:", e);
-           if(isConnected) onStatus?.({ type: 'warning', message: `DESCONECTADO (${e.code})` });
+           if(isConnected) onStatus?.({ type: 'warning', message: `DESCONECTADO` });
            isConnected = false;
         },
         onerror: (err) => {
@@ -236,29 +243,45 @@ export const connectToLiveDebate = async (
 
       const inputData = e.inputBuffer.getChannelData(0);
       
+      // Monitor de Volume (RMS) para debug
+      let sumSquares = 0;
+      for (let i = 0; i < inputData.length; i++) {
+        sumSquares += inputData[i] * inputData[i];
+      }
+      const rms = Math.sqrt(sumSquares / inputData.length);
+      
+      // Se estiver muito silencioso por muito tempo, alerta no console
+      if (rms < 0.001 && Math.random() < 0.005) {
+          console.warn("⚠️ Áudio muito baixo ou silêncio detectado no stream de entrada.");
+      }
+
       try {
+          // Downsample para 16kHz para estabilidade da API
           const pcm16k = downsampleTo16k(inputData, streamRate);
-          // Converter buffer para base64 com cast explícito para evitar erro de tipo do TS
           const base64Data = arrayBufferToBase64(pcm16k.buffer as ArrayBuffer);
 
-          // Usa sessionPromise implícito do activeSession
-          await activeSession.sendRealtimeInput([{ 
-              mimeType: "audio/pcm;rate=16000",
-              data: base64Data
-          }]);
+          activeSession.sessionPromise.then(async () => {
+             await activeSession.sendRealtimeInput([{ 
+                  mimeType: "audio/pcm;rate=16000",
+                  data: base64Data
+              }]);
+          });
       } catch (err) {
-          // Ignora erros de envio momentâneos
+          // Ignora erros de envio momentâneos (ex: rede oscilando)
       }
     };
 
     source.connect(processor);
-    processor.connect(audioContext.destination);
+    // Truque para manter o ScriptProcessor ativo no Chrome: conectar ao destino (mas com volume 0)
+    processor.connect(gain);
+    gain.connect(audioContext.destination);
 
     return {
        disconnect: async () => {
            isConnected = false;
            source.disconnect();
            processor.disconnect();
+           gain.disconnect();
            if (activeSession) activeSession.close();
            if (audioContext.state !== 'closed') await audioContext.close();
        },
