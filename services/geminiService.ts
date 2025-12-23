@@ -40,6 +40,45 @@ const cleanTranscriptText = (text: string): string => {
   return cleaned;
 };
 
+// --- AUDIO PROCESSING ---
+
+// Downsample buffer to 16kHz (Required by Gemini Live API for optimal results)
+const downsampleTo16k = (buffer: Float32Array, sampleRate: number): Int16Array => {
+  if (sampleRate === 16000) {
+    // Direct conversion if already 16k (unlikely in browser)
+    const output = new Int16Array(buffer.length);
+    for (let i = 0; i < buffer.length; i++) {
+        const s = Math.max(-1, Math.min(1, buffer[i]));
+        output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+    return output;
+  }
+  
+  const compression = sampleRate / 16000;
+  const length = Math.floor(buffer.length / compression);
+  const result = new Int16Array(length);
+
+  for (let i = 0; i < length; i++) {
+    // Simple decimation (can be improved with averaging but this is fast/sufficient for speech)
+    const inputIndex = Math.floor(i * compression);
+    // Clamp values
+    const s = Math.max(-1, Math.min(1, buffer[inputIndex]));
+    // Convert to 16-bit PCM
+    result[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+  }
+  return result;
+}
+
+function arrayBufferToBase64(buffer: ArrayBuffer) {
+  let binary = '';
+  const bytes = new Uint8Array(buffer);
+  const len = bytes.byteLength;
+  for (let i = 0; i < len; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return window.btoa(binary);
+}
+
 // -------------------------------------------
 
 export const analyzeStatement = async (
@@ -159,24 +198,6 @@ const calculateRMS = (data: Float32Array): number => {
     return Math.sqrt(sum / data.length);
 };
 
-// Optimized Base64 conversion for Audio chunks to avoid Stack Overflow
-function floatTo16BitPCM(input: Float32Array): string {
-    const output = new Int16Array(input.length);
-    for (let i = 0; i < input.length; i++) {
-        const s = Math.max(-1, Math.min(1, input[i]));
-        output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-    }
-    const bytes = new Uint8Array(output.buffer);
-    
-    let binary = '';
-    const len = bytes.byteLength;
-    const CHUNK_SIZE = 0x8000; 
-    for (let i = 0; i < len; i += CHUNK_SIZE) {
-        binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK_SIZE)));
-    }
-    return btoa(binary);
-}
-
 export const connectToLiveDebate = async (
   stream: MediaStream,
   onTranscript: (data: { text: string; speaker: string; isFinal: boolean }) => void,
@@ -191,11 +212,9 @@ export const connectToLiveDebate = async (
 
   const ai = new GoogleGenAI({ apiKey });
   
-  // [CORRECTION 1] Removed fixed sampleRate to allow native hardware rate (e.g. 44.1k/48k)
+  // 1. Initialize AudioContext at NATIVE rate (e.g. 48000) to avoid hardware crash
   const audioContext = new AudioContext(); 
-  
-  // [DEBUG] Log the actual rate being used
-  console.log("Audio Rate:", audioContext.sampleRate);
+  console.log("Audio Context Rate:", audioContext.sampleRate);
 
   if (audioContext.state === 'suspended') {
     await audioContext.resume();
@@ -210,7 +229,6 @@ export const connectToLiveDebate = async (
   let silenceTimer: any = null;
   let activeSession: any = null;
   
-  // [FIX] Highly sensitive VAD to prevent dropouts
   const VAD_THRESHOLD = 0.001; 
   const SILENCE_HANGOVER_CHUNKS = 5; 
   let silenceChunkCount = 0;
@@ -239,17 +257,16 @@ export const connectToLiveDebate = async (
   };
 
   try {
-    // [CRITICAL] Passing 'callbacks' directly in the parameter object
     activeSession = await ai.live.connect({
       model: LIVE_MODEL_NAME,
       config: {
-        // [CORRECTION 2] Keep TEXT modality as requested
         responseModalities: [Modality.TEXT], 
         speechConfig: {
           voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
         },
-        // [CORRECTION 3] REMOVED inputAudioTranscription entirely to fix Error 1007 (Invalid JSON)
-        systemInstruction: "Role: Portuguese (Brazil) Transcriber. Context: Political debate. Rules: Transcribe spoken Portuguese exactly. IGNORE background noise. DO NOT output credits."
+        // [STRATEGY] Removed inputAudioTranscription to avoid Error 1007.
+        // We rely on the System Prompt to force the model to ACT as a transcriber.
+        systemInstruction: "You are a professional real-time Speech-to-Text transcriber for a Portuguese political debate. Your ONLY task is to output the exact Portuguese transcription of the audio stream continuously. Do NOT answer questions. Do NOT summarize. Just output the words spoken. If the audio is silence or noise, output nothing."
       },
       callbacks: {
         onopen: () => {
@@ -258,13 +275,7 @@ export const connectToLiveDebate = async (
            onStatus?.({ type: 'info', message: "LIVE LINK ESTABLISHED" });
         },
         onmessage: (msg: LiveServerMessage) => {
-           // Debuging raw message
-           // console.log("Msg:", msg);
-
-           // Note: Since inputAudioTranscription is removed, we rely on the model 
-           // generating text in its turn based on the system instruction.
-           // However, standard `serverContent.modelTurn` is usually the response.
-           
+           // We look for text in the model's turn (since we asked it to be a transcriber)
            const textParts = msg.serverContent?.modelTurn?.parts;
            if (textParts) {
                for (const part of textParts) {
@@ -275,7 +286,6 @@ export const connectToLiveDebate = async (
                        text = cleanTranscriptText(text);
                        currentVolatileBuffer += text;
 
-                       // Send 'ghost' update for UI
                        try {
                            onTranscript({ text: currentVolatileBuffer, speaker: DEFAULT_SPEAKER, isFinal: false });
                        } catch (e) { }
@@ -308,14 +318,11 @@ export const connectToLiveDebate = async (
     processor.onaudioprocess = async (e) => {
       if (!isConnected || !activeSession) return; 
 
-      if (pendingAudioRequests >= MAX_PENDING_REQUESTS) {
-          // Drop frame to catch up and prevent lag
-          return;
-      }
+      if (pendingAudioRequests >= MAX_PENDING_REQUESTS) return;
 
       const inputData = e.inputBuffer.getChannelData(0);
       
-      // VAD Check
+      // VAD
       const rms = calculateRMS(inputData);
       if (rms < VAD_THRESHOLD) {
           silenceChunkCount++;
@@ -324,17 +331,17 @@ export const connectToLiveDebate = async (
           silenceChunkCount = 0;
       }
 
-      // Convert to PCM
-      const pcmData = floatTo16BitPCM(inputData);
+      // [CRITICAL FIX] Downsample to 16kHz
+      const pcm16k = downsampleTo16k(inputData, audioContext.sampleRate);
+      const base64Data = arrayBufferToBase64(pcm16k.buffer);
       
-      // Send to API
       try {
           pendingAudioRequests++;
           await activeSession.sendRealtimeInput([{ 
               media: {
-                  // [CORRECTION 4] Dynamic Sample Rate to match AudioContext
-                  mimeType: `audio/pcm;rate=${audioContext.sampleRate}`,
-                  data: pcmData
+                  // Explicitly tell API we are sending 16kHz
+                  mimeType: "audio/pcm;rate=16000",
+                  data: base64Data
               }
           }]);
       } catch (e) {

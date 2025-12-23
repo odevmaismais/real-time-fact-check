@@ -3,14 +3,13 @@ import { connectToDb } from '../_lib/db.js';
 import { ObjectId } from 'mongodb';
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  // CORS Headers
   res.setHeader('Access-Control-Allow-Credentials', 'true');
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
   res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version');
 
   if (req.method === 'OPTIONS') {
-    return res.status(200).end(); //
+    return res.status(200).end(); 
   }
 
   if (req.method !== 'POST') {
@@ -40,7 +39,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     await db.collection('analyses').insertOne(logEntry);
     
-    // Atomically increment token usage in the session document
     if (analysis.tokenUsage) {
         await db.collection('sessions').updateOne(
             { _id: new ObjectId(sessionId as string) },
