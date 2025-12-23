@@ -16,7 +16,7 @@ const cleanTranscriptText = (text: string): string => {
   return text.replace(/\s+/g, ' ').trim();
 };
 
-// Downsample simples e robusto (48k -> 16k)
+// Downsample robusto (48k -> 16k)
 function downsampleTo16k(input: Float32Array, inputRate: number): Int16Array {
     if (inputRate === 16000) {
         return floatTo16BitPCM(input);
@@ -151,13 +151,11 @@ export const connectToLiveDebate = async (
   
   const ai = new GoogleGenAI({ apiKey });
   
-  // Audio Context e Hacks para manter ativo
   const audioContext = new AudioContext(); 
   if (audioContext.state === 'suspended') await audioContext.resume();
 
   const source = audioContext.createMediaStreamSource(stream);
   const processor = audioContext.createScriptProcessor(4096, 1, 1);
-  
   const gain = audioContext.createGain();
   gain.gain.value = 0; 
   
@@ -186,15 +184,16 @@ export const connectToLiveDebate = async (
     activeSession = await ai.live.connect({
       model: LIVE_MODEL_NAME,
       config: {
-        // [FIX] Usar TEXT para evitar que o modelo tente "falar" de volta
-        responseModalities: [Modality.TEXT], 
+        // [MODIFICAÇÃO CRÍTICA] Usamos AUDIO para manter o socket 'vivo' como uma chamada.
+        // O modelo tenta falar, mas nós ignoramos o áudio recebido.
+        responseModalities: [Modality.AUDIO], 
         
-        // Ativa transcrição
+        // Configuramos o idioma explicitamente
         // @ts-ignore
-        inputAudioTranscription: {}, 
+        inputAudioTranscription: { languageCode: "pt-BR" }, 
         
         systemInstruction: {
-            parts: [{ text: "You are a transcription system. Transcribe the audio exactly in Portuguese. Do not translate. Do not answer questions." }]
+            parts: [{ text: "You are a transcriber. Listen to the Portuguese audio and output the text exactly. Do not translate. Do not answer questions. Just transcribe." }]
         }
       },
       callbacks: {
@@ -204,10 +203,14 @@ export const connectToLiveDebate = async (
            onStatus?.({ type: 'info', message: "ESCUTANDO..." });
         },
         onmessage: (msg: LiveServerMessage) => {
+           // Debug profundo: ver o que está chegando
+           // console.log("Msg:", msg.serverContent);
+
            const t1 = msg.serverContent?.inputTranscription?.text;
            const t2 = msg.serverContent?.modelTurn?.parts?.[0]?.text;
            
            if (t1) handleText(t1);
+           // Com Modality.AUDIO, o modelTurn geralmente vem com áudio, mas pode vir com texto
            if (t2) handleText(t2);
            
            if (msg.serverContent?.turnComplete && currentBuffer) {
@@ -237,21 +240,18 @@ export const connectToLiveDebate = async (
       // Monitor de Volume
       let sum = 0;
       for(let i=0; i<100; i++) sum += Math.abs(inputData[i]);
-      // Log esporádico para confirmar que o áudio chega aqui
       if(sum > 0.001 && Math.random() < 0.01) console.log("📊 Audio chegando no processador...");
 
       try {
           const pcm16k = downsampleTo16k(inputData, streamRate);
           const base64Data = arrayBufferToBase64(pcm16k.buffer as ArrayBuffer);
 
-          // [CORREÇÃO CRÍTICA] Envio direto!
-          // REMOVIDO: activeSession.sessionPromise.then(...)
+          // Envio direto e contínuo
           await activeSession.sendRealtimeInput([{ 
               mimeType: "audio/pcm;rate=16000",
               data: base64Data
           }]);
       } catch (err) {
-          // Log leve para não spamar
           // console.error(err); 
       }
     };
