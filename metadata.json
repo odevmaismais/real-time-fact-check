@@ -1,0 +1,8 @@
+{
+  "name": "Dossiê Oculto: Veritas Protocol",
+  "description": "An investigative dashboard for real-time debate analysis and fact-checking using Gemini with Google Search Grounding.",
+  "requestFramePermissions": [
+    "microphone",
+    "display-capture"
+  ]
+}
