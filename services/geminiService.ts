@@ -190,21 +190,19 @@ export const connectToLiveDebate = async (
       model: LIVE_MODEL_NAME,
       config: {
         // [CRÍTICO] A API Live EXIGE Modality.AUDIO para manter a conexão websocket aberta.
-        // Se usar TEXT, ela fecha o socket após a primeira resposta.
         responseModalities: [Modality.AUDIO], 
         
         speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
         },
         
-        // Habilita transcrição de entrada em PT-BR
-        // @ts-ignore
-        inputAudioTranscription: { 
-            languageCode: "pt-BR" 
-        }, 
+        // CORREÇÃO CRÍTICA:
+        // A API Live rejeita 'languageCode' com erro 1007. 
+        // Devemos passar objeto vazio para ativar a transcrição e confiar no systemInstruction.
+        inputAudioTranscription: {}, 
         
         systemInstruction: {
-            parts: [{ text: "Você é um transcritor passivo de debates. Sua ÚNICA função é converter o áudio recebido em texto (transcrição). Mantenha silêncio absoluto no canal de áudio de saída. Apenas transcreva." }]
+            parts: [{ text: "Você é um sistema de transcrição. Sua função é ouvir o áudio em Português do Brasil e gerar o texto correspondente (inputTranscription). Não responda ao usuário. Apenas transcreva o que ouvir." }]
         }
       },
       callbacks: {
