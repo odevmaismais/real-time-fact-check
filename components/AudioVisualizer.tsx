@@ -3,7 +3,7 @@ import React, { useEffect, useRef } from 'react';
 
 interface AudioVisualizerProps {
   active: boolean;
-  analyser: AnalyserNode | null;
+  analyser: AnalyserNode | null; 
 }
 
 export const AudioVisualizer: React.FC<AudioVisualizerProps> = ({ active, analyser }) => {
