@@ -187,6 +187,18 @@ export interface LiveConnectionController {
 }
 
 /**
+ * Calculates Root Mean Square (RMS) amplitude of audio buffer.
+ * Used for Voice Activity Detection (VAD).
+ */
+const calculateRMS = (data: Float32Array): number => {
+    let sum = 0;
+    for (let i = 0; i < data.length; i++) {
+        sum += data[i] * data[i];
+    }
+    return Math.sqrt(sum / data.length);
+};
+
+/**
  * Connects to Gemini Live API to stream audio from a tab/system for transcription.
  */
 export const connectToLiveDebate = async (
@@ -195,34 +207,39 @@ export const connectToLiveDebate = async (
   onError: (err: Error) => void,
   onStatus?: (status: LiveStatus) => void
 ): Promise<LiveConnectionController> => {
-  // Create local instance for independent Live session
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-  
-  // 1. CLONE STREAM: Critical to ensure this service doesn't conflict with Visualizers in the UI
   const streamClone = stream.clone();
   
-  // OPTIMIZATION: Request 16kHz context directly to avoid JS resampling.
-  // Browser will handle resampling natively (C++), which is much faster and smoother.
+  // 16kHz is optimal for Speech-to-Text
   const audioContext = new AudioContext({ sampleRate: 16000 });
-  
   if (audioContext.state === 'suspended') {
     await audioContext.resume();
   }
 
   const source = audioContext.createMediaStreamSource(streamClone);
-  // Use a slightly larger buffer to be safe against main thread jank
   const processor = audioContext.createScriptProcessor(4096, 1, 1);
   
   let currentVolatileBuffer = "";
   const DEFAULT_SPEAKER = "DEBATER"; 
   let isConnected = false;
   let silenceTimer: any = null;
-  let activeSession: any = null; // Store stable session reference
+  let activeSession: any = null;
   
-  // Increased max buffer to allow for longer thoughts before forced cut
-  const MAX_BUFFER_LENGTH = 1500; 
+  // --- VAD & BACKPRESSURE CONFIG ---
+  // RMS Threshold: < 0.01 usually means silence/background hum. 
+  // Increase if environment is noisy.
+  const VAD_THRESHOLD = 0.01; 
+  
+  // Hangover: Number of "silence" chunks to keep sending after speech ends.
+  // 4096 samples @ 16kHz ~= 256ms. 
+  // 3 chunks ~= 750ms of trailing audio to capture soft endings of words.
+  const SILENCE_HANGOVER_CHUNKS = 3;
+  let silenceChunkCount = 0;
 
-  // Helper to commit what we have
+  // Backpressure: If we have too many un-acked requests, drop frames.
+  let pendingAudioRequests = 0;
+  const MAX_PENDING_REQUESTS = 4; // Max concurrent audio pushes allowed
+
   const commitBuffer = () => {
     if (currentVolatileBuffer.trim().length > 0) {
         try {
@@ -236,8 +253,6 @@ export const connectToLiveDebate = async (
 
   const scheduleSilenceCommit = () => {
       if (silenceTimer) clearTimeout(silenceTimer);
-      // WATCHDOG: Wait 2.0 seconds of silence before forcing a commit.
-      // This ensures that if the model doesn't send TurnComplete (common in noise), we still get text.
       silenceTimer = setTimeout(() => {
           if (currentVolatileBuffer.trim().length > 0) {
              console.log("Silence watchdog - forcing commit");
@@ -247,7 +262,6 @@ export const connectToLiveDebate = async (
   };
 
   try {
-    // 2. SESSION PERSISTENCE: Await connection *before* starting loop.
     activeSession = await ai.live.connect({
       model: LIVE_MODEL_NAME,
       config: {
@@ -256,7 +270,6 @@ export const connectToLiveDebate = async (
           voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
         },
         inputAudioTranscription: {}, 
-        // ENHANCED SYSTEM INSTRUCTION FOR ROBUSTNESS
         systemInstruction: `
           Role: Elite Portuguese Speech-to-Text Specialist for Political Analysis.
           Context: Real-time audio feed from a political debate.
@@ -291,10 +304,9 @@ export const connectToLiveDebate = async (
                currentVolatileBuffer += text;
 
                // Safety: Auto-flush if buffer is too big
-               if (currentVolatileBuffer.length > MAX_BUFFER_LENGTH) {
+               if (currentVolatileBuffer.length > 1500) {
                    commitBuffer();
                } else {
-                   // Send PARTIAL update
                    try {
                        onTranscript({ text: currentVolatileBuffer, speaker: DEFAULT_SPEAKER, isFinal: false });
                    } catch (e) { console.error("Callback error (partial)", e); }
@@ -302,28 +314,16 @@ export const connectToLiveDebate = async (
                }
            }
            
-           // 2. Handle Turn Complete (Model finished "listening" phase)
+           // 2. Handle Turn Complete
            if (msg.serverContent?.turnComplete) {
                const trimmed = currentVolatileBuffer.trim();
                const isStrongPunctuation = /[.?!]$/.test(trimmed);
-               
-               // IMPROVED SEGMENTATION LOGIC:
-               // Avoid fragmentation. Merge short sentences to provide better context for analysis.
-               
-               // 1. Substantial length: Commit regardless of punctuation (avoids buffer lockup on run-on sentences).
                const isSubstantial = trimmed.length > 80;
-               
-               // 2. Medium length + Strong Punctuation: Standard sentence completion.
-               // We ignore short sentences (< 30 chars) even if they have punctuation, merging them into the next turn.
                const isCompleteSentence = trimmed.length > 30 && isStrongPunctuation;
                
                if (isSubstantial || isCompleteSentence) {
                    commitBuffer();
                } else {
-                   // HOLD BUFFER:
-                   // Keep the text in the buffer. The next transcription event will append to it.
-                   // If the speaker stops talking (silence), the watchdog (2s) will flush it.
-                   // This effectively merges "Hello." with "I'm here to discuss taxes."
                    scheduleSilenceCommit();
                }
            }
@@ -341,22 +341,51 @@ export const connectToLiveDebate = async (
       }
     });
 
-    // Mark connected only after success
     isConnected = true;
 
-    // Start Audio Processing Loop
-    processor.onaudioprocess = (e) => {
-      // 3. STABILITY: Use stable activeSession reference, no promise chaining here.
+    // --- AUDIO PROCESSING LOOP ---
+    processor.onaudioprocess = async (e) => {
       if (!isConnected || !activeSession) return; 
+
+      // 1. BACKPRESSURE CHECK
+      // If the network is clogging, don't add more fuel to the fire.
+      // Drop frames to let the queue drain.
+      if (pendingAudioRequests >= MAX_PENDING_REQUESTS) {
+          // console.warn("Dropping frame due to backpressure");
+          return;
+      }
 
       const inputData = e.inputBuffer.getChannelData(0);
       
-      // Since context is 16000Hz, we don't need complex downsampling.
-      // Just convert float32 to int16 PCM.
+      // 2. VOICE ACTIVITY DETECTION (VAD)
+      const rms = calculateRMS(inputData);
+      
+      // If RMS is below noise threshold, we might skip sending
+      if (rms < VAD_THRESHOLD) {
+          silenceChunkCount++;
+          // If we have exceeded the "hangover" period (tail of speech), stop sending data.
+          // This saves massive bandwidth and prevents model hallucinations on silence.
+          if (silenceChunkCount > SILENCE_HANGOVER_CHUNKS) {
+              return; 
+          }
+      } else {
+          // Reset silence counter if we hear sound
+          silenceChunkCount = 0;
+      }
+
+      // 3. ENCODING
       const pcmData = floatTo16BitPCM(inputData);
 
+      // 4. SEND WITH BACKPRESSURE TRACKING
       try {
-          activeSession.sendRealtimeInput({ 
+          pendingAudioRequests++;
+          
+          // Note: sendRealtimeInput is void in types, but internally wraps a promise-like structure 
+          // in the websocket queue. We wrap it to track execution flow if possible, 
+          // though strict awaiting inside onaudioprocess is tricky. 
+          // We assume synchronous push to socket queue.
+          
+          await activeSession.sendRealtimeInput({ 
               media: {
                   mimeType: 'audio/pcm;rate=16000',
                   data: pcmData
@@ -364,6 +393,8 @@ export const connectToLiveDebate = async (
           });
       } catch (e) {
           console.error("Error sending audio chunk", e);
+      } finally {
+          pendingAudioRequests--;
       }
     };
 
@@ -379,31 +410,25 @@ export const connectToLiveDebate = async (
            processor.disconnect();
            processor.onaudioprocess = null;
            
-           // Close Audio Context
            if (audioContext.state !== 'closed') {
                await audioContext.close();
            }
            
-           // Cleanup Stream Clone
            streamClone.getTracks().forEach(track => track.stop());
 
-           // Close Session
            if (activeSession) {
-                // We don't await this to prevent UI blocking on cleanup
                try {
                   activeSession.close();
                } catch (e) { console.log("Session close ignored", e); }
            }
        },
        flush: () => {
-           // Manually reset the internal buffer
            currentVolatileBuffer = "";
            if (silenceTimer) clearTimeout(silenceTimer);
        }
     };
   } catch (err: any) {
     onError(err);
-    // Emergency cleanup
     streamClone.getTracks().forEach(track => track.stop());
     if (audioContext.state !== 'closed') await audioContext.close();
     

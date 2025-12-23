@@ -17,7 +17,8 @@ import {
   PauseCircle,
   Loader2,
   Scissors,
-  Layers
+  Layers,
+  AlertOctagon
 } from 'lucide-react';
 import { DebateSegment, AnalysisResult, VerdictType, SpeechRecognition, SpeechRecognitionEvent } from './types';
 import { analyzeStatement, connectToLiveDebate, LiveStatus, LiveConnectionController } from './services/geminiService';
@@ -44,6 +45,7 @@ const App: React.FC = () => {
   const [truthData, setTruthData] = useState<{ time: string; score: number }[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
   const [liveStatus, setLiveStatus] = useState<LiveStatus | null>(null);
+  const [isMounted, setIsMounted] = useState(false);
   
   const [autoScroll, setAutoScroll] = useState(true);
   
@@ -63,6 +65,10 @@ const App: React.FC = () => {
 
   // Logging
   const sessionIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    setIsMounted(true);
+  }, []);
 
   // Scroll to bottom effect
   useEffect(() => {
@@ -228,7 +234,7 @@ const App: React.FC = () => {
             (err) => {
                 console.error("Live Error", err);
                 stopListening();
-                setLiveStatus({ type: 'error', message: "Connection lost. Please retry." });
+                setLiveStatus({ type: 'error', message: "Connection lost. Check API Key or Network." });
             },
             (status) => {
                 setLiveStatus(status);
@@ -291,8 +297,12 @@ const App: React.FC = () => {
       }
   };
 
+  // Check if API Key is configured (simplistic check)
+  const isApiKeyConfigured = Boolean(process.env.API_KEY);
+
   return (
-    <div className="min-h-screen bg-[#050a10] text-gray-200 font-sans selection:bg-toxic-green selection:text-black overflow-hidden flex flex-col">
+    <div className={`min-h-screen bg-[#050a10] text-gray-200 font-sans selection:bg-toxic-green selection:text-black overflow-hidden flex flex-col transition-opacity duration-1000 ${isMounted ? 'opacity-100' : 'opacity-0'}`}>
+      
       {/* Header */}
       <header className="border-b border-gray-800 bg-[#0a141f]/80 backdrop-blur-md px-6 py-3 flex items-center justify-between z-50">
         <div className="flex items-center gap-3">
@@ -326,7 +336,15 @@ const App: React.FC = () => {
         {/* Left Panel: Controls & Visualizer */}
         <div className="w-80 border-r border-gray-800 bg-[#0a141f]/50 flex flex-col p-4 gap-4">
             {/* Input Source Selector */}
-            <div className="bg-black/40 border border-gray-800 rounded p-4">
+            <div className="bg-black/40 border border-gray-800 rounded p-4 relative">
+                {!isApiKeyConfigured && (
+                  <div className="absolute inset-0 bg-black/80 backdrop-blur-sm z-20 flex flex-col items-center justify-center p-4 text-center">
+                    <AlertOctagon className="w-8 h-8 text-alert-red mb-2" />
+                    <p className="text-alert-red font-bold font-mono text-xs">CRITICAL ERROR</p>
+                    <p className="text-gray-400 text-xs mt-1">API_KEY not detected in environment variables.</p>
+                  </div>
+                )}
+                
                 <h3 className="text-xs font-mono text-gray-500 mb-3 uppercase tracking-widest flex items-center gap-2">
                     <Sliders className="w-3 h-3" /> Input Source
                 </h3>
