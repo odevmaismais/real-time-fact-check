@@ -15,7 +15,6 @@ export interface LiveConnectionController {
 }
 
 // --- AUDIO WORKLET (HIGH FIDELITY - SEM BOOST) ---
-// Mantemos a versão que não estoura o áudio do sistema
 const PCM_PROCESSOR_CODE = `
 class PCMProcessor extends AudioWorkletProcessor {
   constructor() {
@@ -37,7 +36,6 @@ class PCMProcessor extends AudioWorkletProcessor {
         let sum = 0;
         let count = 0;
         
-        // Downsampling limpo (Média)
         const start = Math.floor(inputIndex);
         const end = Math.min(inputChannel.length, Math.floor(inputIndex + ratio));
         
@@ -52,8 +50,6 @@ class PCMProcessor extends AudioWorkletProcessor {
         }
 
         const avg = count > 0 ? sum / count : 0;
-        
-        // Sem Boost artificial para evitar clipping em áudio de sistema
         const s = Math.max(-1, Math.min(1, avg));
         const pcm = s < 0 ? s * 0x8000 : s * 0x7FFF;
         
@@ -83,22 +79,47 @@ function arrayBufferToBase64(buffer: ArrayBuffer | SharedArrayBuffer): string {
     return window.btoa(binary);
 }
 
-// Extrator JSON Robusto (Mantido da última melhoria)
+// --- EXTRATOR DE JSON (ALGORITMO DE BALANCEAMENTO) ---
+// Corrige o problema de JSON duplicado ou colado ({...}{...})
 function extractJSON(text: string): any {
     try {
-        const firstOpen = text.indexOf('{');
-        const lastClose = text.lastIndexOf('}');
+        // 1. Remove marcadores de código Markdown para limpar o terreno
+        const cleanText = text.replace(/```json/g, '').replace(/```/g, '');
         
-        if (firstOpen !== -1 && lastClose !== -1 && lastClose > firstOpen) {
-            const jsonCandidate = text.substring(firstOpen, lastClose + 1);
-            return JSON.parse(jsonCandidate);
+        // 2. Encontra o início do primeiro objeto
+        const startIndex = cleanText.indexOf('{');
+        if (startIndex === -1) throw new Error("Início do JSON não encontrado");
+
+        // 3. Algoritmo de Contagem de Chaves (Bracket Counting)
+        // Isso garante que pegamos apenas o PRIMEIRO objeto válido completo
+        let braceCount = 0;
+        let endIndex = -1;
+
+        for (let i = startIndex; i < cleanText.length; i++) {
+            if (cleanText[i] === '{') {
+                braceCount++;
+            } else if (cleanText[i] === '}') {
+                braceCount--;
+                if (braceCount === 0) {
+                    endIndex = i;
+                    break; // Encontrou o fechamento do objeto raiz
+                }
+            }
         }
-        throw new Error("JSON não encontrado");
+
+        if (endIndex !== -1) {
+            const jsonStr = cleanText.substring(startIndex, endIndex + 1);
+            return JSON.parse(jsonStr);
+        }
+        
+        throw new Error("Estrutura JSON incompleta ou quebrada");
+
     } catch (e) {
         console.error("Falha ao extrair JSON:", text);
+        // Fallback seguro para não travar a UI
         return {
             verdict: "UNVERIFIABLE",
-            explanation: "Erro na formatação da resposta da IA.",
+            explanation: "Erro técnico na leitura da resposta da IA (Formato inválido).",
             confidence: 0,
             sources: []
         };
@@ -118,14 +139,14 @@ export const analyzeStatement = async (
   try {
     const prompt = `
       ATUE COMO: Especialista Sênior em Fact-Checking.
-      CONTEXTO DO DEBATE:
+      CONTEXTO:
       ${contextHistory.map(c => `- ${c}`).join("\n")}
       
-      AFIRMAÇÃO PARA VERIFICAR:
+      AFIRMAÇÃO:
       "${text}"
       
       INSTRUÇÕES:
-      1. Use 'googleSearch' para checar fatos.
+      1. Valide fatos usando 'googleSearch'.
       2. Responda APENAS o JSON abaixo.
       
       JSON:
@@ -147,11 +168,14 @@ export const analyzeStatement = async (
     });
 
     const jsonText = response.text || "{}";
-    const data = extractJSON(jsonText);
+    const data = extractJSON(jsonText); // Usa o novo extrator inteligente
 
-    const sources = response.candidates?.[0]?.groundingMetadata?.groundingChunks
+    // Mescla fontes encontradas pelo Google Search (grounding) com as do JSON
+    const googleSources = response.candidates?.[0]?.groundingMetadata?.groundingChunks
       ?.map((chunk: any) => chunk.web)
       .filter((web: any) => web && web.uri && web.title) || [];
+    
+    const finalSources = googleSources.length > 0 ? googleSources : (data.sources || []);
 
     return {
       segmentId,
@@ -159,7 +183,7 @@ export const analyzeStatement = async (
       confidence: data.confidence || 0,
       explanation: data.explanation || "Sem análise.",
       counterEvidence: data.counterEvidence,
-      sources: sources.length > 0 ? sources : (data.sources || []),
+      sources: finalSources,
       sentimentScore: data.sentimentScore || 0,
       logicalFallacies: data.logicalFallacies || [],
       context: contextHistory,
@@ -175,7 +199,7 @@ export const analyzeStatement = async (
       segmentId,
       verdict: VerdictType.UNVERIFIABLE,
       confidence: 0,
-      explanation: "Erro de conexão.",
+      explanation: "Erro de conexão ou limite de quota.",
       sources: [],
       sentimentScore: 0,
       logicalFallacies: [],
@@ -246,8 +270,7 @@ export const connectToLiveDebate = async (
       activeSessionPromise.then(async (session) => {
           if (connectionState !== 'CONNECTED') return;
           try {
-              // CORREÇÃO CRÍTICA: Voltamos para a estrutura { media: ... }
-              // O envio como array [{...}] estava causando o silêncio.
+              // Envia no formato correto { media: ... }
               await session.sendRealtimeInput({ 
                   media: {
                       mimeType: "audio/pcm;rate=16000", 
@@ -328,7 +351,6 @@ export const connectToLiveDebate = async (
       if (raw) {
           currentBuffer += raw; 
           onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: false });
-          // Buffer maior para evitar picotar frases
           if (currentBuffer.length > 200 || raw.match(/[.!?]$/)) {
               onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: true });
               currentBuffer = "";
