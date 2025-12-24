@@ -6,11 +6,26 @@ export enum VerdictType {
   UNVERIFIABLE = 'UNVERIFIABLE'
 }
 
-// Interface para as fontes (Grounding)
 export interface Source {
   uri: string;
   title: string;
 }
+
+export interface LogicalFallacy {
+  name: string;
+  description: string;
+}
+
+export interface DebateSegment {
+  id: string;
+  speaker: string;
+  text: string;
+  timestamp: number;
+}
+
+// Tipos para reconhecimento de fala (Web Speech API ou custom)
+export type SpeechRecognition = any;
+export type SpeechRecognitionEvent = any;
 
 export interface AnalysisResult {
   segmentId: string;
@@ -18,14 +33,13 @@ export interface AnalysisResult {
   confidence: number;
   explanation: string;
   counterEvidence?: string;
-  sources: Source[]; // Corrigido de string[] para Source[]
+  sources: Source[];
   sentimentScore: number;
-  logicalFallacies: string[];
+  logicalFallacies: LogicalFallacy[]; 
   context: string[];
-  // Adicionado para evitar erro no App.tsx
   tokenUsage?: {
     promptTokens: number;
-    responseTokens: number;
+    responseTokens: number; // Nome padronizado
     totalTokens: number;
   };
 }
