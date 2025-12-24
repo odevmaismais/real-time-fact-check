@@ -14,7 +14,8 @@ export interface LiveConnectionController {
     disconnect: () => Promise<void>;
 }
 
-// --- AUDIO WORKLET (HIGH FIDELITY) ---
+// --- AUDIO WORKLET (HIGH FIDELITY - SEM BOOST) ---
+// Mantemos a versão que não estoura o áudio do sistema
 const PCM_PROCESSOR_CODE = `
 class PCMProcessor extends AudioWorkletProcessor {
   constructor() {
@@ -36,6 +37,7 @@ class PCMProcessor extends AudioWorkletProcessor {
         let sum = 0;
         let count = 0;
         
+        // Downsampling limpo (Média)
         const start = Math.floor(inputIndex);
         const end = Math.min(inputChannel.length, Math.floor(inputIndex + ratio));
         
@@ -50,6 +52,8 @@ class PCMProcessor extends AudioWorkletProcessor {
         }
 
         const avg = count > 0 ? sum / count : 0;
+        
+        // Sem Boost artificial para evitar clipping em áudio de sistema
         const s = Math.max(-1, Math.min(1, avg));
         const pcm = s < 0 ? s * 0x8000 : s * 0x7FFF;
         
@@ -79,34 +83,29 @@ function arrayBufferToBase64(buffer: ArrayBuffer | SharedArrayBuffer): string {
     return window.btoa(binary);
 }
 
-// NOVO EXTRATOR DE JSON (CIRÚRGICO)
-// Ignora markdown, textos antes/depois e pega apenas o primeiro objeto JSON válido.
+// Extrator JSON Robusto (Mantido da última melhoria)
 function extractJSON(text: string): any {
     try {
-        // Encontra onde começa o primeiro objeto JSON e onde termina o último
         const firstOpen = text.indexOf('{');
         const lastClose = text.lastIndexOf('}');
         
         if (firstOpen !== -1 && lastClose !== -1 && lastClose > firstOpen) {
-            // Extrai apenas o conteúdo entre { e }
             const jsonCandidate = text.substring(firstOpen, lastClose + 1);
             return JSON.parse(jsonCandidate);
         }
-        
-        throw new Error("Nenhum objeto JSON encontrado na resposta.");
+        throw new Error("JSON não encontrado");
     } catch (e) {
         console.error("Falha ao extrair JSON:", text);
-        // Retorna um objeto de erro seguro para não quebrar a UI
         return {
             verdict: "UNVERIFIABLE",
-            explanation: "Erro técnico ao processar a resposta da IA (Formato inválido).",
+            explanation: "Erro na formatação da resposta da IA.",
             confidence: 0,
             sources: []
         };
     }
 }
 
-// --- FACT CHECKING (PROMPT MELHORADO) ---
+// --- FACT CHECKING ---
 export const analyzeStatement = async (
   text: string,
   segmentId: string,
@@ -119,25 +118,21 @@ export const analyzeStatement = async (
   try {
     const prompt = `
       ATUE COMO: Especialista Sênior em Fact-Checking.
-      
-      TAREFA: Analisar a veracidade da afirmação abaixo.
-      
-      HISTÓRICO RECENTE (Contexto):
+      CONTEXTO DO DEBATE:
       ${contextHistory.map(c => `- ${c}`).join("\n")}
       
-      AFIRMAÇÃO:
+      AFIRMAÇÃO PARA VERIFICAR:
       "${text}"
       
       INSTRUÇÕES:
-      1. Use a 'googleSearch' para validar dados.
-      2. Seja direto.
-      3. IMPORTANTE: Retorne APENAS o JSON abaixo, sem formatação Markdown (\`\`\`).
+      1. Use 'googleSearch' para checar fatos.
+      2. Responda APENAS o JSON abaixo.
       
-      FORMATO JSON:
+      JSON:
       {
         "verdict": "TRUE" | "FALSE" | "MISLEADING" | "OPINION" | "UNVERIFIABLE",
-        "confidence": 0.0 a 1.0,
-        "explanation": "Explicação curta.",
+        "confidence": 0.9,
+        "explanation": "Resumo curto.",
         "sources": [{"title": "Fonte", "uri": "URL"}]
       }
     `;
@@ -152,9 +147,8 @@ export const analyzeStatement = async (
     });
 
     const jsonText = response.text || "{}";
-    const data = extractJSON(jsonText); // Usa o novo extrator
+    const data = extractJSON(jsonText);
 
-    // Garante que sources seja um array
     const sources = response.candidates?.[0]?.groundingMetadata?.groundingChunks
       ?.map((chunk: any) => chunk.web)
       .filter((web: any) => web && web.uri && web.title) || [];
@@ -163,7 +157,7 @@ export const analyzeStatement = async (
       segmentId,
       verdict: (data.verdict as VerdictType) || VerdictType.UNVERIFIABLE,
       confidence: data.confidence || 0,
-      explanation: data.explanation || "Sem análise detalhada.",
+      explanation: data.explanation || "Sem análise.",
       counterEvidence: data.counterEvidence,
       sources: sources.length > 0 ? sources : (data.sources || []),
       sentimentScore: data.sentimentScore || 0,
@@ -181,7 +175,7 @@ export const analyzeStatement = async (
       segmentId,
       verdict: VerdictType.UNVERIFIABLE,
       confidence: 0,
-      explanation: "Erro de conexão com o modelo.",
+      explanation: "Erro de conexão.",
       sources: [],
       sentimentScore: 0,
       logicalFallacies: [],
@@ -252,10 +246,14 @@ export const connectToLiveDebate = async (
       activeSessionPromise.then(async (session) => {
           if (connectionState !== 'CONNECTED') return;
           try {
-              await session.sendRealtimeInput([{ 
-                  mimeType: "audio/pcm;rate=16000", 
-                  data: base64Data
-              }]);
+              // CORREÇÃO CRÍTICA: Voltamos para a estrutura { media: ... }
+              // O envio como array [{...}] estava causando o silêncio.
+              await session.sendRealtimeInput({ 
+                  media: {
+                      mimeType: "audio/pcm;rate=16000", 
+                      data: base64Data
+                  }
+              });
           } catch (e: any) {
               if (e.message && (e.message.includes("CLOSING") || e.message.includes("CLOSED"))) return;
               console.warn("Tx Warning:", e);
@@ -330,7 +328,7 @@ export const connectToLiveDebate = async (
       if (raw) {
           currentBuffer += raw; 
           onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: false });
-          // Buffer maior para evitar cortes prematuros
+          // Buffer maior para evitar picotar frases
           if (currentBuffer.length > 200 || raw.match(/[.!?]$/)) {
               onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: true });
               currentBuffer = "";
