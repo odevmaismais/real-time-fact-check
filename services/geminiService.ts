@@ -2,11 +2,10 @@ import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
 import { AnalysisResult, VerdictType } from "../types";
 
 const MODEL_NAME = "gemini-2.0-flash-exp";
-// CORREÇÃO: Prefixo 'models/' explícito conforme solicitado pelo log de rede esperado
-const LIVE_MODEL_NAME = "models/gemini-2.0-flash-exp";
+const LIVE_MODEL_NAME = "gemini-2.0-flash-exp";
 
 // --- TIPOS E ESTADOS ---
- 
+
 export type LiveStatus = {
   type: 'info' | 'warning' | 'error';
   message: string;
@@ -19,8 +18,7 @@ export interface LiveConnectionController {
 }
 
 // --- AUDIO WORKLET CODE (INLINE) ---
-// Processamento seguro em Thread separada
-// MELHORIA: Downsampling com média (Box Filter) e Soft Limiter (tanh) para clareza vocal.
+// Processador com Interpolação Linear para áudio suave (High Quality Resampling)
 const PCM_PROCESSOR_CODE = `
 class PCMProcessor extends AudioWorkletProcessor {
   constructor() {
@@ -35,51 +33,38 @@ class PCMProcessor extends AudioWorkletProcessor {
     if (!input || !input[0]) return true;
     
     const inputChannel = input[0];
-    // sampleRate é global no AudioWorkletScope
-    const ratio = sampleRate / this.targetRate;
+    const inputRate = sampleRate;
     
-    let inputIndex = 0;
+    // Fator de passo para o downsample
+    const step = inputRate / this.targetRate;
+    let sourceIndex = 0;
     
-    while (inputIndex < inputChannel.length) {
-        let sum = 0;
-        let count = 0;
-        
-        // Downsampling com Média (Anti-Aliasing simples)
-        // Em vez de pular amostras, tiramos a média do intervalo.
-        const start = Math.floor(inputIndex);
-        const end = Math.min(inputChannel.length, Math.floor(inputIndex + ratio));
-        
-        for (let i = start; i < end; i++) {
-            sum += inputChannel[i];
-            count++;
-        }
-        
-        // Fallback para evitar divisão por zero em casos de borda
-        if (count === 0 && start < inputChannel.length) {
-            sum = inputChannel[start];
-            count = 1;
-        }
+    // Loop de processamento com Interpolação Linear
+    // Isso evita o aliasing e a "voz robótica" que confunde a IA
+    while (sourceIndex < inputChannel.length - 1) {
+       const indexFloor = Math.floor(sourceIndex);
+       const indexCeil = indexFloor + 1;
+       const fraction = sourceIndex - indexFloor;
 
-        const avg = count > 0 ? sum / count : 0;
-        
-        // SMART GAIN + SOFT LIMITER
-        // Math.tanh atua como um compressor natural:
-        // - Aumenta sinais baixos (linear perto de 0)
-        // - Suaviza sinais altos sem cortar (clipping digital duro)
-        // Ganho de 2.5x é suficiente para captar vozes normais sem distorção.
-        const boosted = Math.tanh(avg * 2.5); 
-        
-        // Conversão Float (-1.0 a 1.0) -> Int16
-        const pcm = boosted < 0 ? boosted * 0x8000 : boosted * 0x7FFF;
-        
-        if (this.bufferIndex >= this.buffer.length) {
+       const sample1 = inputChannel[indexFloor];
+       const sample2 = inputChannel[indexCeil];
+
+       // Fórmula de Interpolação: Weighted Average
+       const val = sample1 + fraction * (sample2 - sample1);
+       
+       // Clamp para evitar distorção (-1 a 1)
+       const s = Math.max(-1, Math.min(1, val));
+       
+       // Conversão PCM Int16
+       const pcm = s < 0 ? s * 0x8000 : s * 0x7FFF;
+       
+       if (this.bufferIndex >= this.buffer.length) {
            this.port.postMessage(this.buffer.slice(0, this.bufferIndex));
            this.bufferIndex = 0;
-        }
-        
-        this.buffer[this.bufferIndex++] = pcm;
-        
-        inputIndex += ratio;
+       }
+       
+       this.buffer[this.bufferIndex++] = pcm;
+       sourceIndex += step;
     }
     return true;
   }
@@ -197,10 +182,11 @@ export const connectToLiveDebate = async (
 
   const initAudioStack = async () => {
       try {
+          // Deixar o navegador usar a taxa nativa para evitar glitches
           audioContext = new AudioContext(); 
           if (audioContext.state === 'suspended') await audioContext.resume();
 
-          console.log(`🔊 AudioContext iniciado em ${audioContext.sampleRate}Hz`);
+          console.log(`🎤 Audio Context Rate: ${audioContext.sampleRate}Hz`);
 
           const blob = new Blob([PCM_PROCESSOR_CODE], { type: "application/javascript" });
           const workletUrl = URL.createObjectURL(blob);
@@ -219,7 +205,7 @@ export const connectToLiveDebate = async (
           sourceNode.connect(workletNode);
           workletNode.connect(audioContext.destination); 
           
-          console.log("🔊 Audio Worklet Initialized");
+          console.log("🔊 Audio Worklet Initialized (Linear Interpolation)");
 
       } catch (e) {
           console.error("Falha ao iniciar Audio Engine", e);
@@ -230,34 +216,19 @@ export const connectToLiveDebate = async (
   const sendAudioChunk = (pcmInt16: Int16Array) => {
       if (connectionState !== 'CONNECTED' || !activeSessionPromise) return;
 
-      // Telemetria
-      let sumSq = 0;
-      for (let i = 0; i < pcmInt16.length; i++) {
-        sumSq += pcmInt16[i] * pcmInt16[i];
-      }
-      const rms = Math.sqrt(sumSq / pcmInt16.length);
-
-      if (rms === 0) {
-        // Silence
-      } else if (Math.random() > 0.98) { 
-        console.debug(`🔊 Tx Chunk | RMS: ${Math.floor(rms)}`);
-      }
-
       const base64Data = arrayBufferToBase64(pcmInt16.buffer);
 
       activeSessionPromise.then(async (session) => {
           if (connectionState !== 'CONNECTED') return;
           try {
-              // Envia objeto formatado corretamente { media: ... }
-              await session.sendRealtimeInput({ 
-                  media: {
-                      mimeType: "audio/pcm;rate=16000", 
-                      data: base64Data
-                  }
-              });
+              // Rate 16000 é mandatório para o Gemini Live
+              await session.sendRealtimeInput([{ 
+                  mimeType: "audio/pcm;rate=16000", 
+                  data: base64Data
+              }]);
           } catch (e: any) {
               if (e.message && (e.message.includes("CLOSING") || e.message.includes("CLOSED"))) return;
-              console.warn("Tx Error:", e);
+              console.warn("Erro de envio:", e);
           }
       }).catch(() => {});
   };
@@ -270,29 +241,27 @@ export const connectToLiveDebate = async (
 
     try {
         const sessionPromise = ai.live.connect({
-          model: LIVE_MODEL_NAME, 
+          model: LIVE_MODEL_NAME,
           config: {
-            // Modality TEXT para stream contínuo
+            // TEXT: Garante stream em tempo real sem buffering
             responseModalities: [Modality.TEXT], 
             
-            // Ativa transcrição (objeto vazio)
+            // Input Vazio: Schema correto para evitar erro 1007
             // @ts-ignore
             inputAudioTranscription: { }, 
             
-            // System Instruction Refinada e Concisa para Transcrição Verbatim
             systemInstruction: {
-                parts: [{ text: "Transcreva o áudio para Português do Brasil (PT-BR) imediatamente. Transcrição verbatim: palavra por palavra. Não resuma. Não responda a perguntas. Não use formatação de roteiro. Apenas o texto falado." }]
+                // Instrução focada em QUALIDADE e COESÃO, não apenas velocidade
+                parts: [{ text: "You are an expert audio transcriber. Your goal is to generate coherent, grammatically correct Portuguese text. Join fragmented words and fix disfluencies. Output clear, readable text stream." }]
             },
           },
           callbacks: {
             onopen: () => {
-               console.log("🟢 Conectado (Mode: TEXT, Transc: ON)");
+               console.log("🟢 Conectado (Quality Mode)");
                connectionState = 'CONNECTED';
                onStatus?.({ type: 'info', message: "ONLINE" });
             },
             onmessage: (msg: LiveServerMessage) => {
-               // A transcrição chega via inputTranscription (o que o usuário fala)
-               // ou modelTurn (o que o modelo responde, se configurado para responder)
                const inputTranscript = msg.serverContent?.inputTranscription?.text;
                const modelText = msg.serverContent?.modelTurn?.parts?.[0]?.text;
                
@@ -302,13 +271,11 @@ export const connectToLiveDebate = async (
             onclose: (e) => {
                console.log(`🔴 Socket Fechado (${e.code})`);
                connectionState = 'DISCONNECTED';
-               
-               if (e.code === 1000) {
+               if (e.code === 1000 || e.code === 1005) {
                    shouldMaintainConnection = false;
                    onStatus?.({ type: 'info', message: "Desconectado" });
                    return;
                }
-
                if (shouldMaintainConnection) {
                    connectionState = 'RECONNECTING';
                    onStatus?.({ type: 'warning', message: "RECONECTANDO..." });
@@ -340,6 +307,7 @@ export const connectToLiveDebate = async (
   const handleText = (raw: string) => {
       const text = cleanTranscriptText(raw);
       if (text.length > 0) {
+          console.log("📝 Texto:", text); 
           currentBuffer += " " + text;
           onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: false });
           
