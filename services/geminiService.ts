@@ -9,7 +9,7 @@ export type LiveStatus = {
   message: string;
 };
 
-// --- UTILS DE ÁUDIO (MATEMÁTICA PURA) ---
+// --- UTILS DE ÁUDIO ---
 
 const cleanTranscriptText = (text: string): string => {
   if (!text) return "";
@@ -18,7 +18,6 @@ const cleanTranscriptText = (text: string): string => {
 
 /**
  * Converte Float32 (Navegador) para Int16 (PCM) E faz o Downsample para 16kHz.
- * Isso é crucial para que o Gemini entenda a velocidade da fala.
  */
 function downsampleAndConvertToPCM(input: Float32Array, inputRate: number): ArrayBuffer {
     const targetRate = 16000;
@@ -30,7 +29,7 @@ function downsampleAndConvertToPCM(input: Float32Array, inputRate: number): Arra
         for (let i = 0; i < input.length; i++) {
             const s = Math.max(-1, Math.min(1, input[i]));
             const val = s < 0 ? s * 0x8000 : s * 0x7FFF;
-            view.setInt16(i * 2, val, true); // True = Little Endian
+            view.setInt16(i * 2, val, true); // Little Endian
         }
         return buffer;
     }
@@ -43,7 +42,6 @@ function downsampleAndConvertToPCM(input: Float32Array, inputRate: number): Arra
     
     for (let i = 0; i < newLength; i++) {
         const offset = Math.floor(i * ratio);
-        // Garante que não estoure o array original
         const valFloat = input[Math.min(offset, input.length - 1)];
         
         // Clamp e Conversão
@@ -55,17 +53,20 @@ function downsampleAndConvertToPCM(input: Float32Array, inputRate: number): Arra
     return buffer;
 }
 
+/**
+ * OTIMIZAÇÃO: Conversão iterativa robusta para Base64.
+ * Evita "Maximum call stack size exceeded" causados por spread operators ou .apply em arrays grandes.
+ */
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
     let binary = '';
     const bytes = new Uint8Array(buffer);
     const len = bytes.byteLength;
-    const chunkSize = 0x8000; // 32k chunks para evitar stack overflow
     
-    for (let i = 0; i < len; i += chunkSize) {
-        const chunk = bytes.subarray(i, Math.min(i + chunkSize, len));
-        binary += String.fromCharCode.apply(null, Array.from(chunk));
+    // Processamento iterativo seguro
+    for (let i = 0; i < len; i++) {
+        binary += String.fromCharCode(bytes[i]);
     }
-    return btoa(binary);
+    return window.btoa(binary);
 }
 
 // -------------------------------------------
@@ -136,7 +137,7 @@ export const analyzeStatement = async (
 };
 
 // -------------------------------------------
-// CONEXÃO LIVE (16kHz FORCE)
+// CONEXÃO LIVE (Otimizada)
 // -------------------------------------------
 
 export interface LiveConnectionController {
@@ -195,27 +196,42 @@ export const connectToLiveDebate = async (
           model: LIVE_MODEL_NAME,
           config: {
             responseModalities: [Modality.TEXT], 
-            // @ts-ignore
-            inputAudioTranscription: {}, 
+            
+            // CORREÇÃO CRÍTICA: O modelo PRECISA ser especificado para habilitar o ASR.
+            // Passar um objeto vazio {} desabilita o processamento de áudio.
+            inputAudioTranscription: {
+                model: LIVE_MODEL_NAME 
+            },
+            
             systemInstruction: {
-                parts: [{ text: "Transcreva o áudio para Português." }]
+                parts: [{ text: "Transcreva o áudio para Português. Seja preciso." }]
             },
           },
           callbacks: {
             onopen: () => {
-               console.log("🟢 Conectado (16kHz Mode)!");
+               console.log("🟢 Conectado (ASR Enabled)!");
                onStatus?.({ type: 'info', message: "ESCUTANDO" });
                reconnectCount = 0;
             },
             onmessage: (msg: LiveServerMessage) => {
+               // DEBUG LOG: Essencial para entender o que o servidor está retornando
+               // console.log("📨 Payload:", JSON.stringify(msg.serverContent, null, 2));
+
                const t1 = msg.serverContent?.inputTranscription?.text;
                const t2 = msg.serverContent?.modelTurn?.parts?.[0]?.text;
-               if (t1) handleText(t1);
-               if (t2) handleText(t2);
+               
+               if (t1) {
+                   // console.log("Input Transcript:", t1);
+                   handleText(t1);
+               }
+               if (t2) {
+                   // console.log("Model Turn:", t2);
+                   handleText(t2);
+               }
             },
             onclose: (e) => {
                if (shouldMaintainConnection) {
-                   console.log("🔄 Reconectando...");
+                   console.log("🔄 Reconectando (CloseEvent)...");
                    setTimeout(establishConnection, 100); 
                }
             },
@@ -226,7 +242,10 @@ export const connectToLiveDebate = async (
         activeSessionPromise = sessionPromise;
 
         sessionPromise.catch(err => {
-            if (shouldMaintainConnection) setTimeout(establishConnection, 1000); 
+            if (shouldMaintainConnection) {
+                console.log("🔄 Reconectando (Promise Error)...");
+                setTimeout(establishConnection, 1000); 
+            }
         });
 
     } catch (err) {
@@ -244,7 +263,7 @@ export const connectToLiveDebate = async (
       console.log(`🎤 Input Rate: ${streamRate}Hz -> Convertendo para 16000Hz`);
 
       source = audioContext.createMediaStreamSource(stream);
-      // Buffer de 4096 é seguro
+      // 4096 amostras = ~256ms de áudio em 16kHz, bom equilíbrio latência/performance
       processor = audioContext.createScriptProcessor(4096, 1, 1);
       gain = audioContext.createGain();
       gain.gain.value = 0;
@@ -254,24 +273,26 @@ export const connectToLiveDebate = async (
 
           const inputData = e.inputBuffer.getChannelData(0);
           
-          if (Math.random() < 0.05) console.log("💓 Enviando Áudio 16k...");
-
-          // 1. Volume Boost (5x)
+          // 1. Volume Boost (5x) - Ajuda o modelo a detectar fala em microfones baixos
           const boosted = new Float32Array(inputData.length);
           for (let i = 0; i < inputData.length; i++) boosted[i] = inputData[i] * 5.0; 
 
           try {
               // 2. Downsample e Conversão PCM rigorosa
               const pcmBuffer = downsampleAndConvertToPCM(boosted, streamRate);
+              
+              // 3. Conversão Otimizada para Base64 (sem estourar a stack)
               const base64Data = arrayBufferToBase64(pcmBuffer);
 
               activeSessionPromise.then(async (session) => {
                  await session.sendRealtimeInput([{ 
-                      mimeType: "audio/pcm;rate=16000", // Agora é verdade!
+                      mimeType: "audio/pcm", // Simplificado para garantir compatibilidade
                       data: base64Data
                   }]);
               }).catch(() => {});
-          } catch (err) {}
+          } catch (err) {
+              console.error("Erro processamento áudio:", err);
+          }
       };
 
       source.connect(processor);
