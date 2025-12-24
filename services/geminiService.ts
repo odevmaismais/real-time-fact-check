@@ -2,26 +2,22 @@ import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
 import { AnalysisResult, VerdictType } from "../types";
 
 const MODEL_NAME = "gemini-2.0-flash-exp";
-// Prefixo 'models/' é necessário para a estabilidade da conexão em algumas regiões
+// Prefixo 'models/' é obrigatório para garantir a rota correta
 const LIVE_MODEL_NAME = "models/gemini-2.0-flash-exp";
 
-// --- TIPOS E ESTADOS ---
-
+// --- TIPOS ---
 export type LiveStatus = {
   type: 'info' | 'warning' | 'error';
   message: string;
 };
 
-type ConnectionState = 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED' | 'RECONNECTING';
-
 export interface LiveConnectionController {
     disconnect: () => Promise<void>;
 }
 
-// --- AUDIO WORKLET CODE (INLINE) ---
-// PROCESSADOR PURO (FLAT RESPONSE)
-// Removemos qualquer ganho (boost). O sinal de vídeo já é alto o suficiente.
-// Usamos apenas um filtro de média para converter 48kHz -> 16kHz sem distorção.
+// --- AUDIO WORKLET (HIGH FIDELITY - NO BOOST) ---
+// Removemos todos os ganhos e compressores.
+// Fazemos apenas o 'Box Filter' (média) para converter 48k -> 16k mantendo a qualidade original.
 const PCM_PROCESSOR_CODE = `
 class PCMProcessor extends AudioWorkletProcessor {
   constructor() {
@@ -36,16 +32,14 @@ class PCMProcessor extends AudioWorkletProcessor {
     if (!input || !input[0]) return true;
     
     const inputChannel = input[0];
-    const inputRate = sampleRate;
-    const ratio = inputRate / this.targetRate;
-    
+    const ratio = sampleRate / this.targetRate;
     let inputIndex = 0;
     
     while (inputIndex < inputChannel.length) {
         let sum = 0;
         let count = 0;
         
-        // Downsampling por Média (Evita ruído de aliasing)
+        // Média das amostras (Box Filter) para evitar aliasing
         const start = Math.floor(inputIndex);
         const end = Math.min(inputChannel.length, Math.floor(inputIndex + ratio));
         
@@ -54,19 +48,19 @@ class PCMProcessor extends AudioWorkletProcessor {
             count++;
         }
         
-        // Proteção para bordas
+        // Fallback para bordas do buffer
         if (count === 0 && start < inputChannel.length) {
             sum = inputChannel[start];
             count = 1;
         }
 
+        // Média Pura (Volume Original)
         const avg = count > 0 ? sum / count : 0;
         
-        // SEM BOOST: O sinal passa original.
-        // Apenas garantimos que não exceda os limites (-1 a 1)
+        // Apenas Clamp de segurança (-1 a 1) sem amplificação
         const s = Math.max(-1, Math.min(1, avg));
         
-        // Conversão para PCM 16-bit
+        // Conversão PCM 16-bit
         const pcm = s < 0 ? s * 0x8000 : s * 0x7FFF;
         
         if (this.bufferIndex >= this.buffer.length) {
@@ -100,7 +94,7 @@ function arrayBufferToBase64(buffer: ArrayBuffer | SharedArrayBuffer): string {
     return window.btoa(binary);
 }
 
-// --- FACT CHECKING (COM SANITIZAÇÃO JSON) ---
+// --- FACT CHECKING (COM PARSER SEGURO) ---
 export const analyzeStatement = async (
   text: string,
   segmentId: string,
@@ -128,7 +122,7 @@ export const analyzeStatement = async (
       },
     });
 
-    // Sanitização: Remove blocos Markdown se o modelo os enviar
+    // Sanitização de Markdown para evitar SyntaxError no JSON
     let jsonText = response.text || "{}";
     jsonText = jsonText.replace(/```json/g, "").replace(/```/g, "").trim();
 
@@ -185,7 +179,7 @@ export const connectToLiveDebate = async (
   const stream = originalStream.clone();
   const ai = new GoogleGenAI({ apiKey });
 
-  let connectionState: ConnectionState = 'DISCONNECTED';
+  let connectionState: 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED' | 'RECONNECTING' = 'DISCONNECTED';
   let shouldMaintainConnection = true;
   
   let activeSessionPromise: Promise<any> | null = null;
@@ -199,7 +193,7 @@ export const connectToLiveDebate = async (
           audioContext = new AudioContext(); 
           if (audioContext.state === 'suspended') await audioContext.resume();
 
-          console.log(`🔊 AudioContext: ${audioContext.sampleRate}Hz (PURE PCM - NO BOOST)`);
+          console.log(`🔊 AudioContext: ${audioContext.sampleRate}Hz`);
 
           const blob = new Blob([PCM_PROCESSOR_CODE], { type: "application/javascript" });
           const workletUrl = URL.createObjectURL(blob);
@@ -217,8 +211,7 @@ export const connectToLiveDebate = async (
 
           sourceNode.connect(workletNode);
           workletNode.connect(audioContext.destination); 
-          
-          console.log("🔊 Worklet Pronto");
+          console.log("🔊 Worklet Iniciado");
 
       } catch (e) {
           console.error("Audio Init Error:", e);
@@ -256,10 +249,11 @@ export const connectToLiveDebate = async (
           model: LIVE_MODEL_NAME, 
           config: {
             responseModalities: [Modality.TEXT], 
+            // Configuração correta para ativar transcrição sem erro 1007
             // @ts-ignore
             inputAudioTranscription: { }, 
             systemInstruction: {
-                parts: [{ text: "You are a precise real-time transcriber. Transcribe the Portuguese audio stream exactly as spoken. Do not wait for punctuation. Output words immediately." }]
+                parts: [{ text: "You are a real-time transcriber. Transcribe the Portuguese audio stream exactly as spoken. Output words immediately." }]
             },
           },
           callbacks: {
@@ -311,16 +305,17 @@ export const connectToLiveDebate = async (
     }
   };
 
+  // --- LÓGICA DE TEXTO (Sem picotar) ---
   let currentBuffer = "";
   const handleText = (raw: string) => {
-      // Recebe o texto BRUTO para preservar espaços e colar palavras corretamente.
+      // Recebe o texto BRUTO para preservar espaços e colar palavras.
       if (raw) {
           currentBuffer += raw; 
           
-          // Envia para UI com trim VISUAL apenas
+          // Envia para UI com trim VISUAL
           onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: false });
           
-          // Limpa buffer em pontuação ou limite seguro
+          // Limpa buffer em frases completas
           if (currentBuffer.length > 200 || raw.match(/[.!?]$/)) {
               onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: true });
               currentBuffer = "";
