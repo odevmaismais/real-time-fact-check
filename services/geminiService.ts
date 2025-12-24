@@ -120,7 +120,7 @@ export const analyzeStatement = async (
 };
 
 // -------------------------------------------
-// CONEXÃO LIVE (Websocket Seguro)
+// CONEXÃO LIVE (BLINDADA)
 // -------------------------------------------
 
 export interface LiveConnectionController {
@@ -145,7 +145,7 @@ export const connectToLiveDebate = async (
   let shouldMaintainConnection = true;
   let activeSessionPromise: Promise<any> | null = null;
   
-  // NOVA FLAG DE CONTROLE DE ESTADO
+  // 🛡️ FLAG DE PROTEÇÃO: Impede envio se o socket caiu
   let isConnected = false;
 
   let audioContext: AudioContext | null = null;
@@ -191,7 +191,7 @@ export const connectToLiveDebate = async (
           callbacks: {
             onopen: () => {
                console.log("🟢 Conectado (ASR Enabled)!");
-               isConnected = true; // ATIVAR ENVIO
+               isConnected = true; // ✅ SOCKET ABERTO
                onStatus?.({ type: 'info', message: "ESCUTANDO" });
                reconnectCount = 0;
             },
@@ -202,8 +202,8 @@ export const connectToLiveDebate = async (
                if (t2) handleText(t2);
             },
             onclose: (e) => {
-               isConnected = false; // PARAR ENVIO IMEDIATAMENTE
-               console.log("🔴 Conexão Fechada");
+               isConnected = false; // 🛑 SOCKET FECHADO - Bloqueia envios
+               console.log(`🔴 Conexão Fechada (Code: ${e.code})`);
                if (shouldMaintainConnection) {
                    console.log("🔄 Reconectando em 1s...");
                    setTimeout(establishConnection, 1000); 
@@ -246,7 +246,7 @@ export const connectToLiveDebate = async (
       gain.gain.value = 0;
 
       processor.onaudioprocess = async (e) => {
-          // VERIFICAÇÃO RIGOROSA: Se não estiver conectado, não faz nada.
+          // GATE 1: Se o sistema diz que está desconectado, nem processa
           if (!activeSessionPromise || !isConnected) return;
 
           const inputData = e.inputBuffer.getChannelData(0);
@@ -256,17 +256,23 @@ export const connectToLiveDebate = async (
               const base64Data = arrayBufferToBase64(pcmBuffer);
 
               activeSessionPromise.then(async (session) => {
-                 // SEGUNDA VERIFICAÇÃO: A conexão pode ter caído enquanto o Promise resolvia
+                 // GATE 2: Verifica novamente antes de enviar (Race Condition Protection)
                  if (!isConnected) return;
 
                  try {
+                     // Voltei para audio/pcm;rate=16000 para garantir que o server aceite
                      await session.sendRealtimeInput([{ 
-                          mimeType: "audio/pcm",
+                          mimeType: "audio/pcm;rate=16000",
                           data: base64Data
                       }]);
-                 } catch (sendError) {
-                     // Ignora erros de envio isolados para não poluir o log
-                     // Se for erro crítico, o onclose/onerror vai lidar
+                 } catch (sendError: any) {
+                     // 🛡️ CATCH SILENCIOSO: Se o socket fechar durante o envio, ignoramos o erro
+                     // para não poluir o console ou crashar a app.
+                     if (sendError.message?.includes("CLOSING") || sendError.message?.includes("CLOSED")) {
+                         isConnected = false; // Força atualização do estado
+                     } else {
+                         console.warn("Erro de envio não-crítico:", sendError);
+                     }
                  }
               }).catch(() => {});
           } catch (err) {
