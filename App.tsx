@@ -17,7 +17,7 @@ import {
 } from 'lucide-react';
 import { DebateSegment, AnalysisResult, VerdictType } from './types';
 import { analyzeStatement, connectToLiveDebate, LiveStatus, LiveConnectionController } from './services/geminiService';
-// import { loggingService } from './services/loggingService'; // BACKEND DESATIVADO
+// Backend removido para estabilidade
 import { AnalysisCard } from './components/AnalysisCard';
 import { TruthChart } from './components/TruthChart';
 import { AudioVisualizer } from './components/AudioVisualizer';
@@ -51,8 +51,6 @@ const App: React.FC = () => {
   const analyserRef = useRef<AnalyserNode | null>(null);
   const visualizerStreamRef = useRef<MediaStream | null>(null);
   const [analyserNode, setAnalyserNode] = useState<AnalyserNode | null>(null);
-  
-  // const sessionIdRef = useRef<string | null>(null); // BACKEND DESATIVADO
 
   useEffect(() => { setIsMounted(true); }, []);
 
@@ -70,7 +68,6 @@ const App: React.FC = () => {
     return (textCost + audioCost).toFixed(5);
   };
 
-  // --- PROCESS QUEUE ---
   useEffect(() => {
     const processQueue = async () => {
         if (isProcessing || analysisQueue.length === 0) return;
@@ -100,11 +97,6 @@ const App: React.FC = () => {
                 }
 
                 setAnalyses(prev => ({ ...prev, [segment.id]: analysis }));
-                
-                // BACKEND REMOVIDO:
-                // if (sessionIdRef.current) {
-                //     loggingService.logAnalysis(sessionIdRef.current, segment, analysis);
-                // }
                 
                 let score = 0;
                 if (analysis.verdict === VerdictType.TRUE) score = 1;
@@ -145,7 +137,7 @@ const App: React.FC = () => {
          const isLongEnough = fullText.length > 80;
 
          if (!hasTerminalPunctuation && !isLongEnough && fullText.length < 50) {
-             console.log("Buffering fragment:", fullText);
+             console.log("Buffering:", fullText);
              pendingMergeBufferRef.current = fullText;
              setCurrentStreamingText(fullText + "..."); 
              return;
@@ -182,18 +174,11 @@ const App: React.FC = () => {
       pendingMergeBufferRef.current = "";
       setCurrentStreamingText('');
       
-      if (liveControlRef.current) {
-          liveControlRef.current.flush();
-      }
+      if (liveControlRef.current) liveControlRef.current.flush();
   };
 
   const startListening = async () => {
     if (inputMode === 'none') return;
-    
-    // BACKEND DESATIVADO:
-    // const sid = await loggingService.startSession(inputMode);
-    // if (sid) sessionIdRef.current = sid;
-
     setIsListening(true);
     setLiveAudioSeconds(0);
     
@@ -214,9 +199,9 @@ const App: React.FC = () => {
                 } as any);
                 
                 if (stream.getAudioTracks().length === 0) {
-                     alert("⚠️ ATENÇÃO: Nenhum áudio detectado!\n\nMarque a opção 'Compartilhar áudio da guia'.");
+                     alert("⚠️ ERRO: Marque 'Compartilhar áudio da guia' na janela de seleção.");
                      stream.getTracks().forEach(t => t.stop());
-                     throw new Error("No audio track detected");
+                     throw new Error("No audio track");
                 }
             }
         } catch (mediaErr: any) {
@@ -240,29 +225,25 @@ const App: React.FC = () => {
             handleTranscriptData,
             (err) => {
                 console.error("Live Error", err);
-                setIsListening(false);
-                setLiveStatus({ type: 'error', message: "Connection lost." });
+                // Reconecta silenciosamente se possível, senão para
+                if (isListening) setLiveStatus({ type: 'warning', message: "Reconectando..." });
             },
             (status) => setLiveStatus(status)
         );
         liveControlRef.current = controller;
 
     } catch (err: any) {
-        console.error("Failed to start listening", err);
+        console.error("Start error", err);
         setIsListening(false);
         if (liveTimerRef.current) clearInterval(liveTimerRef.current);
-        setLiveStatus({ type: 'error', message: err.message === "Permission denied" ? "Microphone Access Denied" : "Failed to access audio." });
+        setLiveStatus({ type: 'error', message: "Falha no Áudio" });
     }
   };
 
   const stopListening = async () => {
       setIsListening(false);
-      // BACKEND DESATIVADO
-      // if (sessionIdRef.current) {
-      //     await loggingService.endSession(sessionIdRef.current, calculateCost(), liveAudioSeconds);
-      //     sessionIdRef.current = null;
-      // }
       if (liveTimerRef.current) clearInterval(liveTimerRef.current);
+      
       if (liveControlRef.current) {
           await liveControlRef.current.disconnect();
           liveControlRef.current = null;
@@ -284,7 +265,7 @@ const App: React.FC = () => {
   const handleManualSubmit = (e: React.FormEvent) => {
       e.preventDefault();
       if (!inputText.trim()) return;
-      handleTranscriptData({ text: inputText, speaker: "MANUAL_INPUT", isFinal: true });
+      handleTranscriptData({ text: inputText, speaker: "MANUAL", isFinal: true });
       setInputText('');
   };
 
@@ -296,29 +277,18 @@ const App: React.FC = () => {
   const isApiKeyConfigured = Boolean(process.env.API_KEY);
 
   return (
-    <div className={`min-h-screen bg-[#050a10] text-gray-200 font-sans selection:bg-toxic-green selection:text-black overflow-hidden flex flex-col transition-opacity duration-1000 ${isMounted ? 'opacity-100' : 'opacity-0'}`}>
-      <header className="border-b border-gray-800 bg-[#0a141f]/80 backdrop-blur-md px-6 py-3 flex items-center justify-between z-50">
+    <div className={`min-h-screen bg-[#050a10] text-gray-200 font-sans selection:bg-toxic-green selection:text-black overflow-hidden flex flex-col ${isMounted ? 'opacity-100' : 'opacity-0'}`}>
+      <header className="border-b border-gray-800 bg-[#0a141f]/80 px-6 py-3 flex items-center justify-between z-50">
         <div className="flex items-center gap-3">
-          <Activity className="w-6 h-6 text-toxic-green animate-pulse" />
+          <Activity className="w-6 h-6 text-toxic-green" />
           <h1 className="text-xl font-mono font-bold tracking-wider text-transparent bg-clip-text bg-gradient-to-r from-toxic-green to-neon-cyan">
             DOSSIÊ_OCULTO
-            <span className="text-xs ml-2 text-gray-500 font-normal">REAL-TIME FACT CHECKING</span>
           </h1>
         </div>
         <div className="flex items-center gap-6">
-            {analysisQueue.length > 0 && (
-                <div className="flex items-center gap-2 text-xs font-mono text-neon-cyan animate-pulse bg-neon-cyan/10 px-2 py-1 rounded">
-                    <Layers className="w-3 h-3" />
-                    <span>QUEUE: {analysisQueue.length} PENDING</span>
-                </div>
-            )}
-            <div className="flex items-center gap-2 text-xs font-mono text-gray-400 bg-black/30 px-3 py-1 rounded border border-gray-800">
-                <DollarSign className="w-3 h-3 text-toxic-green" />
-                <span>SESSION_COST: ${calculateCost()}</span>
-            </div>
             <div className="flex items-center gap-2 text-xs font-mono text-gray-400">
-                <div className={`w-2 h-2 rounded-full ${liveStatus?.type === 'error' ? 'bg-alert-red' : liveStatus ? 'bg-yellow-500' : isListening ? 'bg-toxic-green' : 'bg-gray-600'} ${isListening && 'animate-pulse'}`} />
-                <span>{liveStatus?.message || (isListening ? "SYSTEM_ACTIVE" : "SYSTEM_IDLE")}</span>
+                <div className={`w-2 h-2 rounded-full ${liveStatus?.type === 'error' ? 'bg-alert-red' : isListening ? 'bg-toxic-green' : 'bg-gray-600'} ${isListening && 'animate-pulse'}`} />
+                <span>{liveStatus?.message || (isListening ? "ATIVO" : "INATIVO")}</span>
             </div>
         </div>
       </header>
@@ -327,35 +297,22 @@ const App: React.FC = () => {
         <div className="w-80 border-r border-gray-800 bg-[#0a141f]/50 flex flex-col p-4 gap-4">
             <div className="bg-black/40 border border-gray-800 rounded p-4 relative">
                 {!isApiKeyConfigured && (
-                  <div className="absolute inset-0 bg-black/80 backdrop-blur-sm z-20 flex flex-col items-center justify-center p-4 text-center">
+                  <div className="absolute inset-0 bg-black/80 z-20 flex flex-col items-center justify-center p-4 text-center">
                     <AlertOctagon className="w-8 h-8 text-alert-red mb-2" />
-                    <p className="text-alert-red font-bold font-mono text-xs">CRITICAL ERROR</p>
-                    <p className="text-gray-400 text-xs mt-1">API_KEY missing.</p>
+                    <p className="text-alert-red font-bold text-xs">API_KEY MISSING</p>
                   </div>
                 )}
-                <h3 className="text-xs font-mono text-gray-500 mb-3 uppercase tracking-widest flex items-center gap-2">
-                    <Sliders className="w-3 h-3" /> Input Source
-                </h3>
                 <div className="space-y-2">
-                    <button 
-                        onClick={() => { if(isListening) stopListening(); setInputMode('mic'); }}
-                        className={`w-full flex items-center gap-3 px-3 py-2 rounded text-sm transition-all ${inputMode === 'mic' ? 'bg-toxic-green/10 text-toxic-green border border-toxic-green/50' : 'bg-gray-900 text-gray-400 border border-transparent hover:bg-gray-800'}`}
-                    >
-                        <Mic className="w-4 h-4" /> <span>Microphone</span>
+                    <button onClick={() => { if(isListening) stopListening(); setInputMode('mic'); }} className={`w-full flex items-center gap-3 px-3 py-2 rounded text-sm transition-all ${inputMode === 'mic' ? 'bg-toxic-green/10 text-toxic-green border-toxic-green/50 border' : 'bg-gray-900 text-gray-400'}`}>
+                        <Mic className="w-4 h-4" /> <span>Microfone</span>
                     </button>
-                    <button 
-                        onClick={() => { if(isListening) stopListening(); setInputMode('tab'); }}
-                        className={`w-full flex items-center gap-3 px-3 py-2 rounded text-sm transition-all ${inputMode === 'tab' ? 'bg-neon-cyan/10 text-neon-cyan border border-neon-cyan/50' : 'bg-gray-900 text-gray-400 border border-transparent hover:bg-gray-800'}`}
-                    >
-                        <MonitorPlay className="w-4 h-4" /> <span>System/Tab Audio</span>
+                    <button onClick={() => { if(isListening) stopListening(); setInputMode('tab'); }} className={`w-full flex items-center gap-3 px-3 py-2 rounded text-sm transition-all ${inputMode === 'tab' ? 'bg-neon-cyan/10 text-neon-cyan border-neon-cyan/50 border' : 'bg-gray-900 text-gray-400'}`}>
+                        <MonitorPlay className="w-4 h-4" /> <span>Áudio da Guia</span>
                     </button>
                 </div>
                 {inputMode !== 'none' && (
-                    <button 
-                        onClick={toggleListening}
-                        className={`mt-4 w-full flex items-center justify-center gap-2 py-3 rounded font-bold uppercase tracking-wide text-xs transition-all ${isListening ? 'bg-alert-red hover:bg-red-600 text-white shadow-[0_0_15px_rgba(255,0,0,0.4)]' : 'bg-toxic-green hover:bg-green-400 text-black shadow-[0_0_15px_rgba(0,255,136,0.4)]'}`}
-                    >
-                        {isListening ? <><StopCircle className="w-4 h-4" /> Terminate Link</> : <><Zap className="w-4 h-4" /> Initialize</>}
+                    <button onClick={toggleListening} className={`mt-4 w-full flex items-center justify-center gap-2 py-3 rounded font-bold uppercase tracking-wide text-xs transition-all ${isListening ? 'bg-alert-red text-white' : 'bg-toxic-green text-black'}`}>
+                        {isListening ? <><StopCircle className="w-4 h-4" /> PARAR</> : <><Zap className="w-4 h-4" /> INICIAR</>}
                     </button>
                 )}
             </div>
@@ -367,71 +324,59 @@ const App: React.FC = () => {
 
         <div className="flex-1 flex flex-col bg-[#050a10] relative">
             <div className="absolute top-0 left-0 right-0 h-16 bg-gradient-to-b from-[#050a10] to-transparent z-10 pointer-events-none" />
-            <div className="flex-1 overflow-y-auto p-6 space-y-6 scrollbar-thin scrollbar-thumb-gray-800 scrollbar-track-transparent">
+            <div className="flex-1 overflow-y-auto p-6 space-y-6 scrollbar-thin scrollbar-thumb-gray-800">
                 {segments.length === 0 && !currentStreamingText && (
                     <div className="h-full flex flex-col items-center justify-center text-gray-600 opacity-50">
-                        <Radio className="w-16 h-16 mb-4 animate-pulse" />
-                        <p className="font-mono text-sm tracking-widest">AWAITING SIGNAL INPUT...</p>
-                        <p className="text-xs text-gray-700 mt-2 font-mono">Ensure "Share Tab Audio" is checked</p>
+                        <Radio className="w-16 h-16 mb-4" />
+                        <p className="font-mono text-sm tracking-widest">AGUARDANDO ÁUDIO...</p>
                     </div>
                 )}
                 {segments.map(segment => (
-                    <div key={segment.id} className="group relative pl-4 border-l border-gray-800 hover:border-gray-600 transition-colors">
-                        <div className="absolute -left-[5px] top-0 w-2 h-2 rounded-full bg-gray-800 group-hover:bg-toxic-green transition-colors" />
+                    <div key={segment.id} className="pl-4 border-l border-gray-800">
                         <div className="flex items-center gap-2 mb-1">
                             <span className="text-[10px] font-mono text-gray-500">{new Date(segment.timestamp).toLocaleTimeString()}</span>
-                            <span className={`text-xs font-bold uppercase tracking-wide ${segment.speaker.includes('1') || segment.speaker.includes('A') ? 'text-neon-cyan' : 'text-toxic-green'}`}>{segment.speaker}</span>
+                            <span className="text-xs font-bold uppercase text-toxic-green">{segment.speaker}</span>
                         </div>
-                        <p className="text-lg text-gray-200 font-light leading-relaxed">{segment.text}</p>
-                        {!analyses[segment.id] && (segment.text.length > 60 && segment.text.split(/\s+/).length >= 8 && (/[.?!]$/.test(segment.text.trim()) || segment.text.length > 120)) && (
+                        <p className="text-lg text-gray-200 font-light">{segment.text}</p>
+                        {!analyses[segment.id] && (segment.text.length > 50) && (
                             <div className="mt-2 flex items-center gap-2 text-neon-cyan text-xs font-mono animate-pulse">
-                                <Cpu className="w-3 h-3" />
-                                {analysisQueue.some(s => s.id === segment.id) || isProcessing ? "QUEUED FOR ANALYSIS..." : "ANALYZING PATTERNS..."}
+                                <Cpu className="w-3 h-3" /> ANALISANDO...
                             </div>
                         )}
                     </div>
                 ))}
                 {currentStreamingText && (
-                    <div className="group relative pl-4 border-l border-toxic-green/50">
-                         <div className="absolute -left-[5px] top-0 w-2 h-2 rounded-full bg-toxic-green animate-pulse" />
+                    <div className="pl-4 border-l border-toxic-green/50">
                          <div className="flex items-center gap-2 mb-1">
-                             <span className="text-xs font-bold uppercase tracking-wide text-toxic-green flex items-center gap-2 animate-pulse [text-shadow:0_0_10px_#00ff88]">
-                                DEBATER <span className="ml-1 text-[10px] bg-toxic-green/20 px-1 rounded text-toxic-green border border-toxic-green/30">LIVE</span>
-                             </span>
-                             <button onClick={forceCutSegment} className="ml-4 flex items-center gap-1 bg-gray-800 hover:bg-gray-700 text-xs px-2 py-1 rounded text-white border border-gray-600 transition-colors">
-                                <Scissors className="w-3 h-3" /> CUT NOW
+                             <span className="text-xs font-bold uppercase text-toxic-green animate-pulse">LIVE</span>
+                             <button onClick={forceCutSegment} className="ml-4 flex items-center gap-1 bg-gray-800 text-xs px-2 py-1 rounded text-white border border-gray-600">
+                                <Scissors className="w-3 h-3" /> CUT
                              </button>
                          </div>
-                         <p className="text-lg text-toxic-green/70 font-light leading-relaxed font-mono">
-                            {currentStreamingText}<span className="inline-block w-2 h-4 bg-toxic-green ml-1 animate-pulse" />
-                         </p>
+                         <p className="text-lg text-toxic-green/70 font-mono">{currentStreamingText}</p>
                     </div>
                 )}
                 <div ref={feedEndRef} />
             </div>
             <div className="p-4 border-t border-gray-800 bg-[#0a141f]">
                 <form onSubmit={handleManualSubmit} className="flex gap-2">
-                    <input type="text" value={inputText} onChange={e => setInputText(e.target.value)} placeholder="Manual override injection..." className="flex-1 bg-black/50 border border-gray-700 rounded px-4 py-2 text-sm text-white focus:outline-none focus:border-toxic-green transition-colors font-mono" />
-                    <button type="submit" disabled={!inputText.trim()} className="bg-gray-800 hover:bg-gray-700 disabled:opacity-50 text-white p-2 rounded transition-colors"><Send className="w-4 h-4" /></button>
+                    <input type="text" value={inputText} onChange={e => setInputText(e.target.value)} placeholder="Inserir texto manual..." className="flex-1 bg-black/50 border border-gray-700 rounded px-4 py-2 text-sm text-white" />
+                    <button type="submit" disabled={!inputText.trim()} className="bg-gray-800 text-white p-2 rounded"><Send className="w-4 h-4" /></button>
                 </form>
             </div>
         </div>
 
         <div className="w-96 border-l border-gray-800 bg-[#0a141f]/30 flex flex-col">
             <div className="p-4 border-b border-gray-800 flex items-center justify-between">
-                <h2 className="font-mono text-sm font-bold text-gray-400 uppercase tracking-widest flex items-center gap-2"><Database className="w-4 h-4" /> Analysis Log</h2>
+                <h2 className="font-mono text-sm font-bold text-gray-400 uppercase tracking-widest gap-2 flex"><Database className="w-4 h-4" /> ANÁLISE</h2>
                 <label className="text-[10px] text-gray-500 uppercase cursor-pointer flex items-center gap-1">
-                    <input type="checkbox" checked={autoScroll} onChange={e => setAutoScroll(e.target.checked)} className="accent-toxic-green" /> Auto-Scroll
+                    <input type="checkbox" checked={autoScroll} onChange={e => setAutoScroll(e.target.checked)} className="accent-toxic-green" /> Scroll
                 </label>
             </div>
-            <div className="flex-1 overflow-y-auto p-4 scrollbar-thin scrollbar-thumb-gray-800 scrollbar-track-transparent">
-                 {Object.values(analyses).length === 0 ? (
-                     <div className="mt-20 text-center"><p className="text-gray-600 font-mono text-xs">NO ANOMALIES DETECTED</p></div>
-                 ) : (
-                     Object.values(analyses).map((analysis: AnalysisResult, idx) => (
-                         <AnalysisCard key={idx} analysis={analysis} segmentText={segments.find(s => s.id === analysis.segmentId)?.text || "Unknown Segment"} />
-                     ))
-                 )}
+            <div className="flex-1 overflow-y-auto p-4 scrollbar-thin scrollbar-thumb-gray-800">
+                 {Object.values(analyses).map((analysis: AnalysisResult, idx) => (
+                     <AnalysisCard key={idx} analysis={analysis} segmentText={segments.find(s => s.id === analysis.segmentId)?.text || ""} />
+                 ))}
                  <div ref={analysisEndRef} />
             </div>
         </div>

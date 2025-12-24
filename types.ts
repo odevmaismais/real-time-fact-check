@@ -23,10 +23,6 @@ export interface DebateSegment {
   timestamp: number;
 }
 
-// Tipos para reconhecimento de fala (Web Speech API ou custom)
-export type SpeechRecognition = any;
-export type SpeechRecognitionEvent = any;
-
 export interface AnalysisResult {
   segmentId: string;
   verdict: VerdictType;
@@ -39,7 +35,7 @@ export interface AnalysisResult {
   context: string[];
   tokenUsage?: {
     promptTokens: number;
-    responseTokens: number; // Nome padronizado
+    responseTokens: number;
     totalTokens: number;
   };
 }
