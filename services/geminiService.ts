@@ -18,12 +18,11 @@ export interface LiveConnectionController {
 }
 
 // --- AUDIO WORKLET CODE (INLINE) ---
-// Processador de áudio que roda em thread separada para evitar travamentos da UI.
+// Mantido igual: Processamento seguro em Thread separada
 const PCM_PROCESSOR_CODE = `
 class PCMProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
-    // Aumentado para 4096 para reduzir a frequência de pacotes e evitar erro 1007
     this.buffer = new Int16Array(4096); 
     this.bufferIndex = 0;
     this.targetRate = 16000;
@@ -33,23 +32,18 @@ class PCMProcessor extends AudioWorkletProcessor {
     const input = inputs[0];
     if (!input || !input[0]) return true;
     
-    const inputChannel = input[0]; // Mono
-    const inputRate = sampleRate; // Global do WorkletScope
+    const inputChannel = input[0];
+    const inputRate = sampleRate;
     
-    // Decimação simples para 16kHz
     const step = inputRate / this.targetRate;
     let sourceIndex = 0;
     
     while (sourceIndex < inputChannel.length) {
        const val = inputChannel[Math.floor(sourceIndex)];
-       
-       // Conversão Float32 -> Int16 PCM (Little Endian padrão do JS)
        const s = Math.max(-1, Math.min(1, val));
        const pcm = s < 0 ? s * 0x8000 : s * 0x7FFF;
        
-       // Envia quando o buffer encher
        if (this.bufferIndex >= this.buffer.length) {
-           // .slice cria uma cópia segura para envio
            this.port.postMessage(this.buffer.slice(0, this.bufferIndex));
            this.bufferIndex = 0;
        }
@@ -57,11 +51,9 @@ class PCMProcessor extends AudioWorkletProcessor {
        this.buffer[this.bufferIndex++] = pcm;
        sourceIndex += step;
     }
-
     return true;
   }
 }
-
 registerProcessor('pcm-processor', PCMProcessor);
 `;
 
@@ -164,24 +156,20 @@ export const connectToLiveDebate = async (
   const stream = originalStream.clone();
   const ai = new GoogleGenAI({ apiKey });
 
-  // STATE MACHINE
   let connectionState: ConnectionState = 'DISCONNECTED';
   let shouldMaintainConnection = true;
   
-  // Refs para cleanup
   let activeSessionPromise: Promise<any> | null = null;
   let audioContext: AudioContext | null = null;
   let workletNode: AudioWorkletNode | null = null;
   let sourceNode: MediaStreamAudioSourceNode | null = null;
   let reconnectTimeout: any = null;
 
-  // --- 1. Audio Setup (Worklet) ---
   const initAudioStack = async () => {
       try {
           audioContext = new AudioContext({ sampleRate: 48000 });
           if (audioContext.state === 'suspended') await audioContext.resume();
 
-          // Carrega o Worklet via Blob URL
           const blob = new Blob([PCM_PROCESSOR_CODE], { type: "application/javascript" });
           const workletUrl = URL.createObjectURL(blob);
           await audioContext.audioWorklet.addModule(workletUrl);
@@ -189,9 +177,7 @@ export const connectToLiveDebate = async (
           sourceNode = audioContext.createMediaStreamSource(stream);
           workletNode = new AudioWorkletNode(audioContext, 'pcm-processor');
 
-          // EVENTO DE DADOS (Chega da Thread de Áudio)
           workletNode.port.onmessage = (event) => {
-              // Só processa se estiver CONECTADO
               if (connectionState === 'CONNECTED') {
                   const pcmInt16 = event.data;
                   sendAudioChunk(pcmInt16);
@@ -209,33 +195,23 @@ export const connectToLiveDebate = async (
       }
   };
 
-  // --- 2. WebSocket Logic (Guarded) ---
   const sendAudioChunk = (pcmInt16: Int16Array) => {
-      // Double check antes de converter base64 (poupa CPU)
       if (connectionState !== 'CONNECTED' || !activeSessionPromise) return;
 
       const base64Data = arrayBufferToBase64(pcmInt16.buffer);
 
       activeSessionPromise.then(async (session) => {
           if (connectionState !== 'CONNECTED') return;
-
           try {
-              // CRUCIAL: rate=16000 avisa o server do formato correto
               await session.sendRealtimeInput([{ 
                   mimeType: "audio/pcm;rate=16000", 
                   data: base64Data
               }]);
           } catch (e: any) {
-              // SUPRESSÃO DE ERRO: Se o socket fechou durante o envio, ignoramos
-              if (e.message && (e.message.includes("CLOSING") || e.message.includes("CLOSED"))) {
-                  // O onclose vai lidar com isso, não precisamos logar erro
-                  return;
-              }
+              if (e.message && (e.message.includes("CLOSING") || e.message.includes("CLOSED"))) return;
               console.warn("Erro de envio:", e);
           }
-      }).catch(() => {
-          // Promise rejeitada (sessão morreu), ignorar
-      });
+      }).catch(() => {});
   };
 
   const establishConnection = async () => {
@@ -249,7 +225,13 @@ export const connectToLiveDebate = async (
           model: LIVE_MODEL_NAME,
           config: {
             responseModalities: [Modality.AUDIO], 
-            inputAudioTranscription: { model: LIVE_MODEL_NAME }, 
+            
+            // --- CORREÇÃO DO ERRO 1007 ---
+            // O campo 'model' aqui dentro causa erro de schema no backend.
+            // Enviar objeto vazio {} ativa a transcrição usando o modelo padrão da sessão.
+            // @ts-ignore
+            inputAudioTranscription: { }, 
+            
             systemInstruction: {
                 parts: [{ text: "You are a passive transcription system. Your ONLY job is to transcribe the input audio to Portuguese. Do NOT generate audio responses." }]
             },
@@ -264,7 +246,10 @@ export const connectToLiveDebate = async (
                onStatus?.({ type: 'info', message: "ONLINE" });
             },
             onmessage: (msg: LiveServerMessage) => {
+               // Captura transcrição do usuário (O que você fala)
                const inputTranscript = msg.serverContent?.inputTranscription?.text;
+               
+               // Captura resposta do modelo (se houver)
                const modelText = msg.serverContent?.modelTurn?.parts?.[0]?.text;
                
                if (inputTranscript) handleText(inputTranscript);
@@ -274,11 +259,10 @@ export const connectToLiveDebate = async (
                console.log(`🔴 Socket Fechado (${e.code})`);
                connectionState = 'DISCONNECTED';
                
-               // Se for erro 1000 (Normal) ou 1007 (Erro Protocolo/Formato), NÃO reconecta automaticamente
-               // para evitar loop infinito de crash.
-               if (e.code === 1007 || e.code === 1000) {
-                   onStatus?.({ type: 'error', message: `Erro Fatal (${e.code}). Recarregue.` });
+               // 1000 = Fechamento Normal; 1007 = Erro de Protocolo (Não deve reconectar em loop se persistir)
+               if (e.code === 1000) {
                    shouldMaintainConnection = false;
+                   onStatus?.({ type: 'info', message: "Desconectado" });
                    return;
                }
 
@@ -323,11 +307,9 @@ export const connectToLiveDebate = async (
       }
   };
 
-  // INICIALIZAÇÃO
   await initAudioStack(); 
   establishConnection(); 
 
-  // CONTROLLER PÚBLICO
   return {
        disconnect: async () => {
            console.log("🛑 Encerrando Sessão...");
@@ -336,7 +318,6 @@ export const connectToLiveDebate = async (
            
            if (reconnectTimeout) clearTimeout(reconnectTimeout);
 
-           // 1. Matar Worklet
            if (workletNode) {
                workletNode.port.onmessage = null;
                workletNode.disconnect();
@@ -344,7 +325,6 @@ export const connectToLiveDebate = async (
            if (sourceNode) sourceNode.disconnect();
            if (audioContext && audioContext.state !== 'closed') await audioContext.close();
 
-           // 2. Fechar Socket
            if (activeSessionPromise) {
                try {
                    const session = await activeSessionPromise;
