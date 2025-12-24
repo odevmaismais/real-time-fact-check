@@ -1,5 +1,5 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { connectToDatabase } from '../_lib/db';
+import { connectToDatabase } from '../_lib/db'; // Caminho corrigido
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   res.setHeader('Access-Control-Allow-Credentials', 'true');
@@ -22,13 +22,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         status: 'active',
         metadata: {
             user_agent: req.headers['user-agent'],
-            ip: req.headers['x-forwarded-for'] || req.socket.remoteAddress
+            ip: req.headers['x-forwarded-for']
         }
     });
 
     return res.status(200).json({ success: true });
   } catch (error: any) {
-    console.error('Mongo Error (Session Start):', error);
     return res.status(500).json({ error: error.message });
   }
 }
