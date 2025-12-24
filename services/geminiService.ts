@@ -171,7 +171,7 @@ export const connectToLiveDebate = async (
 
   const initAudioStack = async () => {
       try {
-          // FIX: Remover sampleRate forçado. Deixar o navegador usar a taxa nativa do hardware.
+          // Usa sample rate nativo para evitar artefatos
           audioContext = new AudioContext(); 
           if (audioContext.state === 'suspended') await audioContext.resume();
 
@@ -206,19 +206,17 @@ export const connectToLiveDebate = async (
       if (connectionState !== 'CONNECTED' || !activeSessionPromise) return;
 
       // --- TELEMETRIA DE ÁUDIO ---
-      // Calcula RMS para verificar se há silêncio digital saindo do navegador
       let sumSq = 0;
       for (let i = 0; i < pcmInt16.length; i++) {
         sumSq += pcmInt16[i] * pcmInt16[i];
       }
-      // RMS aproximado (não normalizado para 0-1, mas na escala Int16 0-32768)
       const rms = Math.sqrt(sumSq / pcmInt16.length);
 
       if (rms === 0) {
         console.warn("🔇 ALERTA: Buffer de áudio zerado (Silêncio Digital).");
       } else if (Math.random() > 0.95) { 
-        // Log amostral para não spammar o console
-        console.debug(`🔊 Enviando audio... [Size: ${pcmInt16.length} samples] [RMS: ${Math.floor(rms)}]`);
+        // Debug visual para confirmar fluxo
+        console.debug(`🔊 Enviando audio... [Size: ${pcmInt16.length}] [RMS: ${Math.floor(rms)}]`);
       }
       // ---------------------------
 
@@ -248,18 +246,20 @@ export const connectToLiveDebate = async (
         const sessionPromise = ai.live.connect({
           model: LIVE_MODEL_NAME,
           config: {
-            // FIX: Alterado para TEXT para permitir streaming contínuo sem esperar VAD
+            // FIX CRÍTICO 1: Mudar para TEXT para evitar espera de VAD (silêncio)
             responseModalities: [Modality.TEXT], 
             
-            // Ativa transcrição
+            // FIX CRÍTICO 2: inputAudioTranscription deve existir
             // @ts-ignore
             inputAudioTranscription: { model: LIVE_MODEL_NAME }, 
             
+            // FIX CRÍTICO 3: Instrução explícita para transcrição em tempo real
             systemInstruction: {
-                parts: [{ text: "You are a continuous audio transcriber. Transcribe the input audio to Portuguese in real-time. Do not wait for silence." }]
+                parts: [{ text: "You are a real-time transcriber. Transcribe the audio stream to Portuguese immediately as the words are spoken. Do not wait for complete sentences." }]
             },
             
-            // FIX CRÍTICO: speechConfig REMOVIDO pois é incompatível com Modality.TEXT
+            // FIX CRÍTICO 4: speechConfig REMOVIDO COMPLETAMENTE
+            // A presença de speechConfig com Modality.TEXT causa Erro 1007.
           },
           callbacks: {
             onopen: () => {
@@ -268,10 +268,9 @@ export const connectToLiveDebate = async (
                onStatus?.({ type: 'info', message: "ONLINE" });
             },
             onmessage: (msg: LiveServerMessage) => {
-               // Captura transcrição do usuário (Input do modelo)
+               // A transcrição pode vir como 'inputTranscription' (reconhecimento)
+               // ou como 'modelTurn' (se o modelo decidir "responder" com o texto)
                const inputTranscript = msg.serverContent?.inputTranscription?.text;
-               
-               // Captura resposta do modelo (Se ele decidir falar o texto)
                const modelText = msg.serverContent?.modelTurn?.parts?.[0]?.text;
                
                if (inputTranscript) handleText(inputTranscript);
