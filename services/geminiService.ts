@@ -1,4 +1,4 @@
-import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
+import { GoogleGenAI, LiveServerMessage, Modality, FunctionDeclaration, Type } from "@google/genai";
 import { AnalysisResult, VerdictType } from "../types";
 
 const MODEL_NAME = "gemini-2.0-flash-exp";
@@ -160,9 +160,9 @@ export const connectToLiveDebate = async (
   let isConnected = false;
   let activeSession: any = null;
   
-  // Buffer para acumular áudio antes de enviar (Estabilidade de Rede)
+  // Buffer e Acumuladores de Áudio
   let audioAccumulator: Float32Array = new Float32Array(0);
-  const CHUNK_THRESHOLD = 3; // Acumula 3 chunks (~250ms) antes de enviar
+  const CHUNK_THRESHOLD = 3; 
   let chunkCounter = 0;
 
   const handleText = (raw: string) => {
@@ -179,33 +179,79 @@ export const connectToLiveDebate = async (
       }
   };
 
+  // 1. TOOL DEFINITION
+  const transcriptTool: FunctionDeclaration = {
+      name: "submit_transcript",
+      description: "Submits the raw text transcription of the audio heard.",
+      parameters: {
+          type: Type.OBJECT,
+          properties: {
+              text: {
+                  type: Type.STRING,
+                  description: "The exact Portuguese text transcribed from the audio."
+              }
+          },
+          required: ["text"]
+      }
+  };
+
   try {
     const streamRate = audioContext.sampleRate;
-    console.log(`🎤 Iniciando: Input=${streamRate}Hz`);
+    console.log(`🎤 Iniciando (Function Calling Mode): Input=${streamRate}Hz`);
 
     activeSession = await ai.live.connect({
       model: LIVE_MODEL_NAME,
       config: {
-        responseModalities: [Modality.AUDIO], // AUDIO mantém a sessão aberta
-        // @ts-ignore
-        inputAudioTranscription: {}, // Ativa transcrição (sem params para evitar erro 1007)
+        responseModalities: [Modality.AUDIO], // Mantém a conexão viva
+        speechConfig: {
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
+        },
+        // 2. SYSTEM INSTRUCTION ESTRATÉGICA
         systemInstruction: {
-            parts: [{ text: "You are a transcriber. Transcribe the Portuguese audio exactly. Do not translate. Do not answer." }]
-        }
+            parts: [{ text: "You are a dedicated transcription agent. Your ONLY job is to listen to the Portuguese audio and IMMEDIATELLY call the function `submit_transcript` passing the exact transcribed text. Do not reply with audio. Do not summarize. Just transcribe." }]
+        },
+        tools: [{ functionDeclarations: [transcriptTool] }],
+        // Backup: ativa transcrição passiva caso o function calling falhe
+        // @ts-ignore
+        inputAudioTranscription: {}, 
       },
       callbacks: {
         onopen: () => {
            console.log("🟢 Conectado!");
            isConnected = true;
            onStatus?.({ type: 'info', message: "ESCUTANDO..." });
-           // REMOVIDO: activeSession.send() - Isso causava o fechamento 1000
         },
         onmessage: (msg: LiveServerMessage) => {
-           const t1 = msg.serverContent?.inputTranscription?.text;
-           const t2 = msg.serverContent?.modelTurn?.parts?.[0]?.text;
-           
-           if (t1) handleText(t1);
-           if (t2) handleText(t2);
+           // 3. PROCESSAMENTO DE FUNCTION CALL
+           const parts = msg.serverContent?.modelTurn?.parts;
+           if (parts) {
+               for (const part of parts) {
+                   if (part.functionCall) {
+                       const fc = part.functionCall;
+                       if (fc.name === 'submit_transcript') {
+                           const args = fc.args as any;
+                           if (args && args.text) {
+                               handleText(args.text);
+                           }
+
+                           // IMPORTANTE: Enviar resposta da tool para completar o turno
+                           activeSession.sessionPromise.then(async () => {
+                                await activeSession.sendToolResponse({
+                                    functionResponses: [{
+                                        id: fc.id,
+                                        name: fc.name,
+                                        response: { result: "ok" }
+                                    }]
+                                });
+                           });
+                       }
+                   }
+               }
+           }
+
+           // Backup: Transcrição passiva nativa
+           const tInput = msg.serverContent?.inputTranscription?.text;
+           if (tInput) handleText(tInput);
            
            if (msg.serverContent?.turnComplete && currentBuffer) {
                onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: true });
@@ -231,7 +277,7 @@ export const connectToLiveDebate = async (
 
       const inputData = e.inputBuffer.getChannelData(0);
       
-      // 1. Boost de Volume (5x)
+      // Boost de Volume
       const boosted = new Float32Array(inputData.length);
       let vol = 0;
       for (let i = 0; i < inputData.length; i++) {
@@ -239,7 +285,7 @@ export const connectToLiveDebate = async (
           vol += Math.abs(inputData[i]);
       }
 
-      // 2. Acumulação para envio mais estável
+      // Bufferização
       const temp = new Float32Array(audioAccumulator.length + boosted.length);
       temp.set(audioAccumulator);
       temp.set(boosted, audioAccumulator.length);
@@ -247,10 +293,11 @@ export const connectToLiveDebate = async (
       chunkCounter++;
 
       if (chunkCounter >= CHUNK_THRESHOLD) {
-          if(vol > 0.01) console.log("📡 Enviando Buffer..."); // Debug de envio real
+          if(vol > 0.01) {
+              // console.log("📡 Enviando Buffer..."); 
+          }
           
           try {
-              // 3. Processamento e Envio
               const pcm16k = downsampleTo16k(audioAccumulator, streamRate);
               const base64Data = arrayBufferToBase64(pcm16k.buffer as ArrayBuffer);
 
@@ -259,9 +306,8 @@ export const connectToLiveDebate = async (
                   data: base64Data
               }]);
           } catch (err) {
-              // console.error(err);
+              // Silencioso para não poluir logs
           } finally {
-              // Limpa buffer
               audioAccumulator = new Float32Array(0);
               chunkCounter = 0;
           }
