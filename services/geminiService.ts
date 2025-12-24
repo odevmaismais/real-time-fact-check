@@ -2,6 +2,7 @@ import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
 import { AnalysisResult, VerdictType } from "../types";
 
 const MODEL_NAME = "gemini-2.0-flash-exp";
+// CORREÇÃO CRÍTICA: O prefixo 'models/' é necessário para estabilidade em algumas versões da lib
 const LIVE_MODEL_NAME = "models/gemini-2.0-flash-exp";
 
 // --- TIPOS E ESTADOS ---
@@ -18,7 +19,8 @@ export interface LiveConnectionController {
 }
 
 // --- AUDIO WORKLET CODE (INLINE) ---
-// Mantido o código Híbrido (Box Filter + Tanh Boost) que validamos funcionar
+// Usando a versão que VOCÊ confirmou que funciona (Box Filter + Tanh)
+// Isso garante que o áudio tenha volume suficiente para o VAD do Gemini.
 const PCM_PROCESSOR_CODE = `
 class PCMProcessor extends AudioWorkletProcessor {
   constructor() {
@@ -33,15 +35,15 @@ class PCMProcessor extends AudioWorkletProcessor {
     if (!input || !input[0]) return true;
     
     const inputChannel = input[0];
-    const inputRate = sampleRate;
-    const ratio = inputRate / this.targetRate;
-    
+    // sampleRate é global no escopo do Worklet
+    const ratio = sampleRate / this.targetRate;
     let inputIndex = 0;
     
     while (inputIndex < inputChannel.length) {
         let sum = 0;
         let count = 0;
         
+        // Downsampling com Média (Box Filter)
         const start = Math.floor(inputIndex);
         const end = Math.min(inputChannel.length, Math.floor(inputIndex + ratio));
         
@@ -57,7 +59,8 @@ class PCMProcessor extends AudioWorkletProcessor {
 
         const avg = count > 0 ? sum / count : 0;
         
-        // BOOST: Essencial para o Gemini ouvir o áudio
+        // BOOST INTELIGENTE (Math.tanh)
+        // Aumenta o volume sem distorcer. Essencial para o Gemini não ignorar o áudio.
         const boosted = Math.tanh(avg * 2.5); 
         
         const pcm = boosted < 0 ? boosted * 0x8000 : boosted * 0x7FFF;
@@ -78,6 +81,8 @@ registerProcessor('pcm-processor', PCMProcessor);
 
 // --- UTILS ---
 
+// ATENÇÃO: Use apenas para formatar o texto final para a UI ou para o Prompt de Análise.
+// NÃO use no stream de entrada, pois remove espaços que colam as palavras.
 const cleanTranscriptText = (text: string): string => {
   if (!text) return "";
   return text.replace(/\s+/g, ' ').trim();
@@ -93,7 +98,7 @@ function arrayBufferToBase64(buffer: ArrayBuffer | SharedArrayBuffer): string {
     return window.btoa(binary);
 }
 
-// --- FACT CHECKING (CORRIGIDO) ---
+// --- FACT CHECKING (CORRIGIDO ERRO JSON) ---
 export const analyzeStatement = async (
   text: string,
   segmentId: string,
@@ -121,10 +126,9 @@ export const analyzeStatement = async (
       },
     });
 
-    // --- CORREÇÃO DO ERRO JSON ---
+    // --- CORREÇÃO DE SYNTAX ERROR ---
+    // O Gemini às vezes envia Markdown (```json ... ```) mesmo pedindo JSON.
     let jsonText = response.text || "{}";
-    
-    // Remove marcadores de Markdown (```json ... ```) se existirem
     jsonText = jsonText.replace(/```json/g, "").replace(/```/g, "").trim();
 
     const data = JSON.parse(jsonText);
@@ -194,7 +198,7 @@ export const connectToLiveDebate = async (
           audioContext = new AudioContext(); 
           if (audioContext.state === 'suspended') await audioContext.resume();
 
-          console.log(`🔊 AudioContext iniciado em ${audioContext.sampleRate}Hz`);
+          console.log(`🔊 AudioContext: ${audioContext.sampleRate}Hz (Volume Boost: ON)`);
 
           const blob = new Blob([PCM_PROCESSOR_CODE], { type: "application/javascript" });
           const workletUrl = URL.createObjectURL(blob);
@@ -213,10 +217,10 @@ export const connectToLiveDebate = async (
           sourceNode.connect(workletNode);
           workletNode.connect(audioContext.destination); 
           
-          console.log("🔊 Audio Worklet Initialized");
+          console.log("🔊 Worklet Pronto");
 
       } catch (e) {
-          console.error("Falha ao iniciar Audio Engine", e);
+          console.error("Audio Init Error:", e);
           onError(e as Error);
       }
   };
@@ -235,7 +239,7 @@ export const connectToLiveDebate = async (
               }]);
           } catch (e: any) {
               if (e.message && (e.message.includes("CLOSING") || e.message.includes("CLOSED"))) return;
-              console.warn("Tx Error:", e);
+              console.warn("Tx Warning:", e);
           }
       }).catch(() => {});
   };
@@ -248,18 +252,22 @@ export const connectToLiveDebate = async (
 
     try {
         const sessionPromise = ai.live.connect({
-          model: LIVE_MODEL_NAME, 
+          model: LIVE_MODEL_NAME, // models/gemini-2.0...
           config: {
+            // TEXT = Streaming Real-Time sem buffer de turno
             responseModalities: [Modality.TEXT], 
+            
+            // Input Vazio = Ativa transcrição sem erro 1007
             // @ts-ignore
             inputAudioTranscription: { }, 
+            
             systemInstruction: {
-                parts: [{ text: "Transcreva o áudio para Português do Brasil (PT-BR) imediatamente. Transcrição verbatim: palavra por palavra." }]
+                parts: [{ text: "You are a real-time Portuguese transcriber. Output words immediately. Do not format as script." }]
             },
           },
           callbacks: {
             onopen: () => {
-               console.log("🟢 Conectado (Mode: TEXT, Transc: ON)");
+               console.log("🟢 Conectado!");
                connectionState = 'CONNECTED';
                onStatus?.({ type: 'info', message: "ONLINE" });
             },
@@ -271,7 +279,7 @@ export const connectToLiveDebate = async (
                if (modelText) handleText(modelText);
             },
             onclose: (e) => {
-               console.log(`🔴 Socket Fechado (${e.code})`);
+               console.log(`🔴 Fechado (${e.code})`);
                connectionState = 'DISCONNECTED';
                
                if (e.code === 1000) {
@@ -287,7 +295,7 @@ export const connectToLiveDebate = async (
                }
             },
             onerror: (err) => {
-                console.error("Erro Socket:", err);
+                console.error("Socket Error:", err);
                 connectionState = 'DISCONNECTED';
             }
           }
@@ -306,15 +314,20 @@ export const connectToLiveDebate = async (
     }
   };
 
+  // --- CORREÇÃO DO PICOTADO ---
   let currentBuffer = "";
   const handleText = (raw: string) => {
-      // Mantendo a lógica que corrigiu o texto picotado
+      // Recebe o texto BRUTO (com espaços iniciais se houver).
+      // Isso permite que " po" + "lícia" se torne " polícia".
       if (raw) {
-          console.log("📝 Chunk Puro:", `"${raw}"`); 
+          // console.log("📝", `"${raw}"`); // Debug opcional
           currentBuffer += raw; 
+          
+          // Envia para UI (o trim aqui é visual, não afeta o buffer)
           onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: false });
           
-          if (currentBuffer.length > 150 || raw.match(/[.!?]$/)) {
+          // Limpa buffer em pontuações fortes para evitar strings infinitas
+          if (currentBuffer.length > 200 || raw.match(/[.!?]$/)) {
               onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: true });
               currentBuffer = "";
           }
@@ -326,7 +339,7 @@ export const connectToLiveDebate = async (
 
   return {
        disconnect: async () => {
-           console.log("🛑 Encerrando Sessão...");
+           console.log("🛑 Stop...");
            shouldMaintainConnection = false;
            connectionState = 'DISCONNECTED';
            
