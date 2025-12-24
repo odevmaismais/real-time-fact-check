@@ -1,33 +1,50 @@
-import { MongoClient, Db } from 'mongodb';
+import type { VercelRequest, VercelResponse } from '@vercel/node';
+import { connectToDatabase } from '../_lib/db'; // Caminho corrigido
 
-// Cache da conexão para reutilização entre invocações (Padrão Serverless)
-let cachedClient: MongoClient | null = null;
-let cachedDb: Db | null = null;
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,POST');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-export async function connectToDatabase() {
-  if (cachedClient && cachedDb) {
-    return { client: cachedClient, db: cachedDb };
+  if (req.method === 'OPTIONS') return res.status(200).end();
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
+
+  try {
+    const { sessionId, segmentId, text, analysis } = req.body;
+
+    if (!sessionId || !segmentId || !text) {
+        return res.status(400).json({ error: "Dados obrigatórios faltando" });
+    }
+
+    const { db } = await connectToDatabase();
+
+    await db.collection('debate_segments').updateOne(
+        { segment_id: segmentId },
+        { 
+            $setOnInsert: {
+                session_id: sessionId,
+                text_content: text,
+                created_at: new Date()
+            }
+        },
+        { upsert: true }
+    );
+
+    await db.collection('analysis_logs').insertOne({
+        session_id: sessionId,
+        segment_id: segmentId,
+        verdict: analysis?.verdict || 'UNVERIFIABLE',
+        confidence: analysis?.confidence || 0,
+        explanation: analysis?.explanation || '',
+        raw_response: analysis,
+        created_at: new Date()
+    });
+
+    return res.status(200).json({ success: true });
+
+  } catch (error: any) {
+    console.error('Mongo Error:', error);
+    return res.status(500).json({ error: error.message });
   }
-
-  const uri = process.env.MONGO_URI;
-  if (!uri) {
-    throw new Error("Defina a variável MONGO_URI no .env");
-  }
-
-  // Opções recomendadas para Serverless
-  const client = new MongoClient(uri, {
-    maxPoolSize: 1, // Mantém baixo consumo de conexões no Atlas
-    minPoolSize: 0,
-    serverSelectionTimeoutMS: 5000,
-  });
-
-  await client.connect();
-  
-  // Pega o nome do banco da URI ou usa um padrão
-  const db = client.db(new URL(uri).pathname.substr(1) || 'veritas_live');
-
-  cachedClient = client;
-  cachedDb = db;
-
-  return { client, db };
 }
