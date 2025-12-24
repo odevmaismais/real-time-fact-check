@@ -214,18 +214,13 @@ export const connectToLiveDebate = async (
                reconnectCount = 0;
             },
             onmessage: (msg: LiveServerMessage) => {
-               // DEBUG LOG: Essencial para entender o que o servidor está retornando
-               // console.log("📨 Payload:", JSON.stringify(msg.serverContent, null, 2));
-
                const t1 = msg.serverContent?.inputTranscription?.text;
                const t2 = msg.serverContent?.modelTurn?.parts?.[0]?.text;
                
                if (t1) {
-                   // console.log("Input Transcript:", t1);
                    handleText(t1);
                }
                if (t2) {
-                   // console.log("Model Turn:", t2);
                    handleText(t2);
                }
             },
@@ -273,15 +268,12 @@ export const connectToLiveDebate = async (
 
           const inputData = e.inputBuffer.getChannelData(0);
           
-          // 1. Volume Boost (5x) - Ajuda o modelo a detectar fala em microfones baixos
-          const boosted = new Float32Array(inputData.length);
-          for (let i = 0; i < inputData.length; i++) boosted[i] = inputData[i] * 5.0; 
-
           try {
-              // 2. Downsample e Conversão PCM rigorosa
-              const pcmBuffer = downsampleAndConvertToPCM(boosted, streamRate);
+              // 1. Downsample e Conversão PCM rigorosa
+              // SEM BOOST: Passamos inputData diretamente
+              const pcmBuffer = downsampleAndConvertToPCM(inputData, streamRate);
               
-              // 3. Conversão Otimizada para Base64 (sem estourar a stack)
+              // 2. Conversão Otimizada para Base64 (sem estourar a stack)
               const base64Data = arrayBufferToBase64(pcmBuffer);
 
               activeSessionPromise.then(async (session) => {
