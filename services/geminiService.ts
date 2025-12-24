@@ -75,7 +75,7 @@ const cleanTranscriptText = (text: string): string => {
   return text.replace(/\s+/g, ' ').trim();
 };
 
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
+function arrayBufferToBase64(buffer: ArrayBuffer | SharedArrayBuffer): string {
     let binary = '';
     const bytes = new Uint8Array(buffer);
     const len = bytes.byteLength;
