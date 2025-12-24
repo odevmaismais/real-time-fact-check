@@ -1,54 +1,35 @@
 import React from 'react';
-import {
-  LineChart,
-  Line,
-  XAxis,
-  YAxis,
-  CartesianGrid, 
-  Tooltip,
-  ResponsiveContainer,
-  ReferenceLine
-} from 'recharts';
+import { AnalysisResult, VerdictType } from '../types';
 
 interface TruthChartProps {
-  data: { time: string; score: number }[];
+  history: AnalysisResult[];
 }
 
-export const TruthChart: React.FC<TruthChartProps> = ({ data }) => {
+export const TruthChart: React.FC<TruthChartProps> = ({ history }) => {
+  const stats = {
+    true: history.filter(h => h.verdict === VerdictType.TRUE).length,
+    false: history.filter(h => h.verdict === VerdictType.FALSE).length,
+    misleading: history.filter(h => h.verdict === VerdictType.MISLEADING).length,
+    total: history.length || 1
+  };
+
   return (
-    <div className="h-full w-full p-2">
-      <h3 className="text-toxic-green font-mono text-sm mb-2 flex items-center gap-2">
-        <span className="w-2 h-2 bg-toxic-green animate-pulse rounded-full"></span>
-        TRUTH_OSCILLATOR_V.1
-      </h3>
-      <div className="h-[150px] w-full">
-        <ResponsiveContainer width="100%" height="100%">
-          <LineChart data={data}>
-            <CartesianGrid strokeDasharray="3 3" stroke="#0a141f" />
-            <XAxis 
-              dataKey="time" 
-              hide 
-            />
-            <YAxis 
-              domain={[-1, 1]} 
-              hide 
-            />
-            <Tooltip 
-              contentStyle={{ backgroundColor: '#050a10', borderColor: '#00ff88', color: '#fff' }}
-              itemStyle={{ color: '#00ff88' }}
-            />
-            <ReferenceLine y={0} stroke="#444" strokeDasharray="3 3" />
-            <Line
-              type="monotone"
-              dataKey="score"
-              stroke="#00ff88"
-              strokeWidth={2}
-              dot={false}
-              isAnimationActive={false} // Performance for real-time
-            />
-          </LineChart>
-        </ResponsiveContainer>
-      </div>
+    <div className="flex h-4 w-full rounded-full overflow-hidden bg-slate-700">
+      <div 
+        style={{ width: `${(stats.true / stats.total) * 100}%` }} 
+        className="bg-green-500 h-full transition-all duration-500" 
+        title={`Verdadeiro: ${stats.true}`}
+      />
+      <div 
+        style={{ width: `${(stats.misleading / stats.total) * 100}%` }} 
+        className="bg-orange-500 h-full transition-all duration-500" 
+        title={`Enganoso: ${stats.misleading}`}
+      />
+      <div 
+        style={{ width: `${(stats.false / stats.total) * 100}%` }} 
+        className="bg-red-500 h-full transition-all duration-500" 
+        title={`Falso: ${stats.false}`}
+      />
     </div>
   );
 };
