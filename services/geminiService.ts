@@ -6,7 +6,7 @@ const MODEL_NAME = "gemini-2.0-flash-exp";
 const LIVE_MODEL_NAME = "models/gemini-2.0-flash-exp";
 
 // --- TIPOS E ESTADOS ---
-
+ 
 export type LiveStatus = {
   type: 'info' | 'warning' | 'error';
   message: string;
@@ -20,7 +20,7 @@ export interface LiveConnectionController {
 
 // --- AUDIO WORKLET CODE (INLINE) ---
 // Processamento seguro em Thread separada
-// Mantido: Gain Boost (x3.5) para garantir que áudio de abas seja detectado
+// MELHORIA: Downsampling com média (Box Filter) e Soft Limiter (tanh) para clareza vocal.
 const PCM_PROCESSOR_CODE = `
 class PCMProcessor extends AudioWorkletProcessor {
   constructor() {
@@ -35,26 +35,51 @@ class PCMProcessor extends AudioWorkletProcessor {
     if (!input || !input[0]) return true;
     
     const inputChannel = input[0];
-    const inputRate = sampleRate;
-    const step = inputRate / this.targetRate;
-    let sourceIndex = 0;
+    // sampleRate é global no AudioWorkletScope
+    const ratio = sampleRate / this.targetRate;
     
-    while (sourceIndex < inputChannel.length) {
-       const val = inputChannel[Math.floor(sourceIndex)];
-       
-       // BOOST: Multiplica o volume por 3.5x para evitar que o VAD ignore o áudio
-       const boosted = val * 3.5;
-       const s = Math.max(-1, Math.min(1, boosted));
-       
-       const pcm = s < 0 ? s * 0x8000 : s * 0x7FFF;
-       
-       if (this.bufferIndex >= this.buffer.length) {
+    let inputIndex = 0;
+    
+    while (inputIndex < inputChannel.length) {
+        let sum = 0;
+        let count = 0;
+        
+        // Downsampling com Média (Anti-Aliasing simples)
+        // Em vez de pular amostras, tiramos a média do intervalo.
+        const start = Math.floor(inputIndex);
+        const end = Math.min(inputChannel.length, Math.floor(inputIndex + ratio));
+        
+        for (let i = start; i < end; i++) {
+            sum += inputChannel[i];
+            count++;
+        }
+        
+        // Fallback para evitar divisão por zero em casos de borda
+        if (count === 0 && start < inputChannel.length) {
+            sum = inputChannel[start];
+            count = 1;
+        }
+
+        const avg = count > 0 ? sum / count : 0;
+        
+        // SMART GAIN + SOFT LIMITER
+        // Math.tanh atua como um compressor natural:
+        // - Aumenta sinais baixos (linear perto de 0)
+        // - Suaviza sinais altos sem cortar (clipping digital duro)
+        // Ganho de 2.5x é suficiente para captar vozes normais sem distorção.
+        const boosted = Math.tanh(avg * 2.5); 
+        
+        // Conversão Float (-1.0 a 1.0) -> Int16
+        const pcm = boosted < 0 ? boosted * 0x8000 : boosted * 0x7FFF;
+        
+        if (this.bufferIndex >= this.buffer.length) {
            this.port.postMessage(this.buffer.slice(0, this.bufferIndex));
            this.bufferIndex = 0;
-       }
-       
-       this.buffer[this.bufferIndex++] = pcm;
-       sourceIndex += step;
+        }
+        
+        this.buffer[this.bufferIndex++] = pcm;
+        
+        inputIndex += ratio;
     }
     return true;
   }
@@ -223,8 +248,7 @@ export const connectToLiveDebate = async (
       activeSessionPromise.then(async (session) => {
           if (connectionState !== 'CONNECTED') return;
           try {
-              // CORREÇÃO CRÍTICA: Formato do objeto para sendRealtimeInput.
-              // Anteriormente enviado como array [{ mimeType, data }], o que gerava "realtimeInput": {}
+              // Envia objeto formatado corretamente { media: ... }
               await session.sendRealtimeInput({ 
                   media: {
                       mimeType: "audio/pcm;rate=16000", 
@@ -246,19 +270,19 @@ export const connectToLiveDebate = async (
 
     try {
         const sessionPromise = ai.live.connect({
-          model: LIVE_MODEL_NAME, // Isso posiciona 'model' no setup, fora de 'config'
+          model: LIVE_MODEL_NAME, 
           config: {
-            // Modality TEXT para stream contínuo sem esperar VAD
+            // Modality TEXT para stream contínuo
             responseModalities: [Modality.TEXT], 
             
-            // Ativa transcrição com objeto vazio (sem propriedade 'model' interna)
+            // Ativa transcrição (objeto vazio)
             // @ts-ignore
             inputAudioTranscription: { }, 
             
+            // System Instruction Refinada e Concisa para Transcrição Verbatim
             systemInstruction: {
-                parts: [{ text: "You are a real-time transcriber. Transcribe the audio stream to Portuguese immediately as the words are spoken. Do not wait for complete sentences." }]
+                parts: [{ text: "Transcreva o áudio para Português do Brasil (PT-BR) imediatamente. Transcrição verbatim: palavra por palavra. Não resuma. Não responda a perguntas. Não use formatação de roteiro. Apenas o texto falado." }]
             },
-            // speechConfig: REMOVIDO para evitar Erro 1007
           },
           callbacks: {
             onopen: () => {
