@@ -1,4 +1,4 @@
-import { GoogleGenAI, LiveServerMessage, Modality, FunctionDeclaration, SchemaType } from "@google/genai";
+import { GoogleGenAI, LiveServerMessage, Modality, FunctionDeclaration, Type } from "@google/genai";
 import { AnalysisResult, VerdictType } from "../types";
 
 const MODEL_NAME = "gemini-2.0-flash-exp";
@@ -95,7 +95,12 @@ export const analyzeStatement = async (
       sources: sources,
       sentimentScore: 0,
       logicalFallacies: [],
-      context: contextHistory
+      context: contextHistory,
+      tokenUsage: {
+          promptTokens: response.usageMetadata?.promptTokenCount || 0,
+          responseTokens: response.usageMetadata?.candidatesTokenCount || 0,
+          totalTokens: response.usageMetadata?.totalTokenCount || 0
+      }
     };
   } catch (error) {
     console.error("Erro análise:", error);
@@ -106,6 +111,8 @@ export const analyzeStatement = async (
       explanation: "Erro técnico.",
       sources: [],
       sentimentScore: 0,
+      logicalFallacies: [], // Adicionado para satisfazer a interface
+      context: [],        // Adicionado para satisfazer a interface
     };
   }
 };
@@ -131,7 +138,7 @@ export const connectToLiveDebate = async (
     return { disconnect: async () => {}, flush: () => {} };
   }
 
-  // [CORREÇÃO CRÍTICA] Clona o stream para uso exclusivo do Gemini
+  // Clona o stream para garantir acesso exclusivo ao processador
   const stream = originalStream.clone();
   
   let shouldMaintainConnection = true;
@@ -139,20 +146,23 @@ export const connectToLiveDebate = async (
   let audioContext: AudioContext | null = null;
   let source: MediaStreamAudioSourceNode | null = null;
   let processor: ScriptProcessorNode | null = null;
+  // CORREÇÃO: Declarar gain no escopo externo
+  let gain: GainNode | null = null;
   let reconnectCount = 0;
   let currentBuffer = "";
 
   const ai = new GoogleGenAI({ apiKey });
 
-  // 1. TOOL DEFINITION (Corrigido com SchemaType)
+  // 1. TOOL DEFINITION
   const transcriptTool: FunctionDeclaration = {
       name: "submit_transcript",
       description: "Submits the raw text transcription of the Portuguese speech detected.",
       parameters: {
-          type: SchemaType.OBJECT,
+          // CORREÇÃO: Usar Type.OBJECT (Enum correto)
+          type: Type.OBJECT,
           properties: {
               text: {
-                  type: SchemaType.STRING,
+                  type: Type.STRING,
                   description: "The transcribed text."
               }
           },
@@ -264,7 +274,7 @@ export const connectToLiveDebate = async (
       const streamRate = audioContext.sampleRate;
       source = audioContext.createMediaStreamSource(stream);
       processor = audioContext.createScriptProcessor(4096, 1, 1);
-      gain = audioContext.createGain();
+      gain = audioContext.createGain(); // Agora usa a variável do escopo externo
       gain.gain.value = 0;
 
       processor.onaudioprocess = async (e) => {
@@ -309,7 +319,7 @@ export const connectToLiveDebate = async (
            shouldMaintainConnection = false;
            if (source) source.disconnect();
            if (processor) processor.disconnect();
-           if (gain) gain.disconnect();
+           if (gain) gain.disconnect(); // Agora funciona pois gain está no escopo correto
            if (activeSessionPromise) {
                try {
                    const session = await activeSessionPromise;
