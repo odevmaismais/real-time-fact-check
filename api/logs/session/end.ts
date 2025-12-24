@@ -1,5 +1,5 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { connectToDatabase } from '../../_lib/db';
+import { connectToDatabase } from '../../_lib/db'; // Aqui sobe 2 níveis: session -> logs -> api -> _lib
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   res.setHeader('Access-Control-Allow-Credentials', 'true');
@@ -16,7 +16,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const { db } = await connectToDatabase();
 
-    const result = await db.collection('sessions').updateOne(
+    await db.collection('sessions').updateOne(
         { session_id: sessionId },
         { 
             $set: { 
@@ -26,19 +26,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         }
     );
 
-    if (result.matchedCount === 0) {
-        // Se a sessão não existia (ex: crash do browser antes de salvar), cria uma finalizada
-        await db.collection('sessions').insertOne({
-            session_id: sessionId,
-            started_at: new Date(), // Data aproximada
-            ended_at: new Date(),
-            status: 'completed_orphan'
-        });
-    }
-
     return res.status(200).json({ success: true });
   } catch (error: any) {
-    console.error('Mongo Error (Session End):', error);
     return res.status(500).json({ error: error.message });
   }
 }
