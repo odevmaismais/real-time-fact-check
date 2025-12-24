@@ -13,7 +13,8 @@ import {
   Zap,
   Scissors,
   Layers,
-  AlertOctagon
+  AlertOctagon,
+  Loader2
 } from 'lucide-react';
 import { DebateSegment, AnalysisResult, VerdictType } from './types';
 import { analyzeStatement, connectToLiveDebate, LiveStatus, LiveConnectionController } from './services/geminiService';
@@ -25,6 +26,7 @@ import { v4 as uuidv4 } from 'uuid';
 
 const App: React.FC = () => {
   const [isListening, setIsListening] = useState(false);
+  const [isConnecting, setIsConnecting] = useState(false); // NOVO: Bloqueio de UI
   const [inputMode, setInputMode] = useState<'mic' | 'tab' | 'none'>('none');
   const [inputText, setInputText] = useState('');
   
@@ -178,14 +180,11 @@ const App: React.FC = () => {
   };
 
   const startListening = async () => {
-    if (inputMode === 'none') return;
-    setIsListening(true);
+    if (inputMode === 'none' || isConnecting) return; // Bloqueio
+    
+    setIsConnecting(true); // Trava UI
     setLiveAudioSeconds(0);
     
-    liveTimerRef.current = window.setInterval(() => {
-        setLiveAudioSeconds(prev => prev + 1);
-    }, 1000);
-
     try {
         let stream: MediaStream;
         try {
@@ -205,6 +204,7 @@ const App: React.FC = () => {
                 }
             }
         } catch (mediaErr: any) {
+            setIsConnecting(false);
             if (mediaErr.name === 'NotAllowedError') throw new Error("Permission denied");
             throw mediaErr;
         }
@@ -225,24 +225,36 @@ const App: React.FC = () => {
             handleTranscriptData,
             (err) => {
                 console.error("Live Error", err);
-                // Reconecta silenciosamente se possível, senão para
-                if (isListening) setLiveStatus({ type: 'warning', message: "Reconectando..." });
+                // Status update handles feedback
+                setLiveStatus({ type: 'warning', message: "Instabilidade..." });
             },
             (status) => setLiveStatus(status)
         );
         liveControlRef.current = controller;
+        
+        // Sucesso
+        setIsListening(true);
+        liveTimerRef.current = window.setInterval(() => {
+            setLiveAudioSeconds(prev => prev + 1);
+        }, 1000);
 
     } catch (err: any) {
         console.error("Start error", err);
-        setIsListening(false);
-        if (liveTimerRef.current) clearInterval(liveTimerRef.current);
-        setLiveStatus({ type: 'error', message: "Falha no Áudio" });
+        setLiveStatus({ type: 'error', message: "Falha de Inicialização" });
+    } finally {
+        setIsConnecting(false); // Destrava UI
     }
   };
 
   const stopListening = async () => {
+      // Cleanup Seguro e Assíncrono
       setIsListening(false);
-      if (liveTimerRef.current) clearInterval(liveTimerRef.current);
+      setIsConnecting(false);
+
+      if (liveTimerRef.current) {
+          clearInterval(liveTimerRef.current);
+          liveTimerRef.current = null;
+      }
       
       if (liveControlRef.current) {
           await liveControlRef.current.disconnect();
@@ -256,6 +268,7 @@ const App: React.FC = () => {
           await audioContextRef.current.close();
           audioContextRef.current = null;
       }
+      
       setAnalyserNode(null);
       setLiveStatus(null);
       setCurrentStreamingText('');
@@ -288,7 +301,7 @@ const App: React.FC = () => {
         <div className="flex items-center gap-6">
             <div className="flex items-center gap-2 text-xs font-mono text-gray-400">
                 <div className={`w-2 h-2 rounded-full ${liveStatus?.type === 'error' ? 'bg-alert-red' : isListening ? 'bg-toxic-green' : 'bg-gray-600'} ${isListening && 'animate-pulse'}`} />
-                <span>{liveStatus?.message || (isListening ? "ATIVO" : "INATIVO")}</span>
+                <span>{liveStatus?.message || (isListening ? "ATIVO" : isConnecting ? "CONECTANDO..." : "INATIVO")}</span>
             </div>
         </div>
       </header>
@@ -303,16 +316,31 @@ const App: React.FC = () => {
                   </div>
                 )}
                 <div className="space-y-2">
-                    <button onClick={() => { if(isListening) stopListening(); setInputMode('mic'); }} className={`w-full flex items-center gap-3 px-3 py-2 rounded text-sm transition-all ${inputMode === 'mic' ? 'bg-toxic-green/10 text-toxic-green border-toxic-green/50 border' : 'bg-gray-900 text-gray-400'}`}>
+                    <button 
+                        disabled={isListening || isConnecting}
+                        onClick={() => setInputMode('mic')} 
+                        className={`w-full flex items-center gap-3 px-3 py-2 rounded text-sm transition-all ${inputMode === 'mic' ? 'bg-toxic-green/10 text-toxic-green border-toxic-green/50 border' : 'bg-gray-900 text-gray-400'} disabled:opacity-50 disabled:cursor-not-allowed`}>
                         <Mic className="w-4 h-4" /> <span>Microfone</span>
                     </button>
-                    <button onClick={() => { if(isListening) stopListening(); setInputMode('tab'); }} className={`w-full flex items-center gap-3 px-3 py-2 rounded text-sm transition-all ${inputMode === 'tab' ? 'bg-neon-cyan/10 text-neon-cyan border-neon-cyan/50 border' : 'bg-gray-900 text-gray-400'}`}>
+                    <button 
+                        disabled={isListening || isConnecting}
+                        onClick={() => setInputMode('tab')} 
+                        className={`w-full flex items-center gap-3 px-3 py-2 rounded text-sm transition-all ${inputMode === 'tab' ? 'bg-neon-cyan/10 text-neon-cyan border-neon-cyan/50 border' : 'bg-gray-900 text-gray-400'} disabled:opacity-50 disabled:cursor-not-allowed`}>
                         <MonitorPlay className="w-4 h-4" /> <span>Áudio da Guia</span>
                     </button>
                 </div>
                 {inputMode !== 'none' && (
-                    <button onClick={toggleListening} className={`mt-4 w-full flex items-center justify-center gap-2 py-3 rounded font-bold uppercase tracking-wide text-xs transition-all ${isListening ? 'bg-alert-red text-white' : 'bg-toxic-green text-black'}`}>
-                        {isListening ? <><StopCircle className="w-4 h-4" /> PARAR</> : <><Zap className="w-4 h-4" /> INICIAR</>}
+                    <button 
+                        onClick={toggleListening} 
+                        disabled={isConnecting}
+                        className={`mt-4 w-full flex items-center justify-center gap-2 py-3 rounded font-bold uppercase tracking-wide text-xs transition-all disabled:opacity-50 disabled:cursor-not-allowed ${isListening ? 'bg-alert-red text-white' : 'bg-toxic-green text-black'}`}>
+                        {isConnecting ? (
+                            <><Loader2 className="w-4 h-4 animate-spin" /> CONECTANDO...</>
+                        ) : isListening ? (
+                            <><StopCircle className="w-4 h-4" /> PARAR</>
+                        ) : (
+                            <><Zap className="w-4 h-4" /> INICIAR</>
+                        )}
                     </button>
                 )}
             </div>

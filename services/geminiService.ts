@@ -16,36 +16,51 @@ const cleanTranscriptText = (text: string): string => {
   return text.replace(/\s+/g, ' ').trim();
 };
 
+/**
+ * Converte Float32 (Navegador) para Int16 (PCM) E faz o Downsample para 16kHz.
+ */
 function downsampleAndConvertToPCM(input: Float32Array, inputRate: number): ArrayBuffer {
     const targetRate = 16000;
+    
+    // Se já for 16k, apenas converte
     if (inputRate === targetRate) {
         const buffer = new ArrayBuffer(input.length * 2);
         const view = new DataView(buffer);
         for (let i = 0; i < input.length; i++) {
             const s = Math.max(-1, Math.min(1, input[i]));
             const val = s < 0 ? s * 0x8000 : s * 0x7FFF;
-            view.setInt16(i * 2, val, true);
+            view.setInt16(i * 2, val, true); // Little Endian
         }
         return buffer;
     }
+
+    // Cálculo de Downsample simples
     const ratio = inputRate / targetRate;
     const newLength = Math.ceil(input.length / ratio);
     const buffer = new ArrayBuffer(newLength * 2);
     const view = new DataView(buffer);
+    
     for (let i = 0; i < newLength; i++) {
         const offset = Math.floor(i * ratio);
         const valFloat = input[Math.min(offset, input.length - 1)];
+        
+        // Clamp e Conversão
         const s = Math.max(-1, Math.min(1, valFloat));
         const valInt = s < 0 ? s * 0x8000 : s * 0x7FFF;
-        view.setInt16(i * 2, valInt, true);
+        
+        view.setInt16(i * 2, valInt, true); // Little Endian
     }
     return buffer;
 }
 
+/**
+ * OTIMIZAÇÃO: Conversão iterativa robusta para Base64.
+ */
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
     let binary = '';
     const bytes = new Uint8Array(buffer);
     const len = bytes.byteLength;
+    
     for (let i = 0; i < len; i++) {
         binary += String.fromCharCode(bytes[i]);
     }
@@ -53,7 +68,7 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
 }
 
 // -------------------------------------------
-// FACT CHECKING (REST)
+// FACT CHECKING (Mantido Igual)
 // -------------------------------------------
 export const analyzeStatement = async (
   text: string,
@@ -120,7 +135,7 @@ export const analyzeStatement = async (
 };
 
 // -------------------------------------------
-// CONEXÃO LIVE (BLINDADA)
+// CONEXÃO LIVE (ROBUSTA)
 // -------------------------------------------
 
 export interface LiveConnectionController {
@@ -145,7 +160,7 @@ export const connectToLiveDebate = async (
   let shouldMaintainConnection = true;
   let activeSessionPromise: Promise<any> | null = null;
   
-  // 🛡️ FLAG DE PROTEÇÃO: Impede envio se o socket caiu
+  // 🛡️ GATEKEEPER: Flag atômica de conexão
   let isConnected = false;
 
   let audioContext: AudioContext | null = null;
@@ -180,33 +195,49 @@ export const connectToLiveDebate = async (
         const sessionPromise = ai.live.connect({
           model: LIVE_MODEL_NAME,
           config: {
-            responseModalities: [Modality.TEXT], 
+            // FIX CRÍTICO: Modality.AUDIO impede erro 1007 e queda de conexão
+            responseModalities: [Modality.AUDIO], 
+            
+            // Ativa ASR
             inputAudioTranscription: {
                 model: LIVE_MODEL_NAME 
             },
+            
+            // System Prompt Passivo
             systemInstruction: {
-                parts: [{ text: "Transcreva o áudio para Português. Seja preciso." }]
+                parts: [{ text: "You are a passive transcription system. Your ONLY job is to transcribe the input audio to Portuguese. Do NOT generate audio responses. Do NOT speak. Just listen and transcribe." }]
             },
+            // Configuração de voz dummy (obrigatória para AUDIO modality, mesmo que não usada)
+            speechConfig: {
+                voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
+            }
           },
           callbacks: {
             onopen: () => {
-               console.log("🟢 Conectado (ASR Enabled)!");
-               isConnected = true; // ✅ SOCKET ABERTO
+               console.log("🟢 Conexão Estável (Audio Mode)");
+               isConnected = true; 
                onStatus?.({ type: 'info', message: "ESCUTANDO" });
                reconnectCount = 0;
             },
             onmessage: (msg: LiveServerMessage) => {
-               const t1 = msg.serverContent?.inputTranscription?.text;
-               const t2 = msg.serverContent?.modelTurn?.parts?.[0]?.text;
-               if (t1) handleText(t1);
-               if (t2) handleText(t2);
+               // Prioridade: Transcrição do Input (O que o usuário/áudio disse)
+               const inputTranscript = msg.serverContent?.inputTranscription?.text;
+               if (inputTranscript) {
+                   handleText(inputTranscript);
+               }
+
+               // Se o modelo alucinar e gerar texto, capturamos também, mas ignoramos áudio
+               const modelText = msg.serverContent?.modelTurn?.parts?.[0]?.text;
+               if (modelText) {
+                   handleText(modelText);
+               }
             },
             onclose: (e) => {
-               isConnected = false; // 🛑 SOCKET FECHADO - Bloqueia envios
+               isConnected = false; // Bloqueio imediato
                console.log(`🔴 Conexão Fechada (Code: ${e.code})`);
                if (shouldMaintainConnection) {
-                   console.log("🔄 Reconectando em 1s...");
-                   setTimeout(establishConnection, 1000); 
+                   onStatus?.({ type: 'warning', message: "RECONECTANDO..." });
+                   setTimeout(establishConnection, 500); 
                }
             },
             onerror: (err) => {
@@ -238,45 +269,53 @@ export const connectToLiveDebate = async (
       if (audioContext.state === 'suspended') await audioContext.resume();
       
       const streamRate = audioContext.sampleRate;
-      console.log(`🎤 Input Rate: ${streamRate}Hz -> Convertendo para 16000Hz`);
+      console.log(`🎤 Input Rate: ${streamRate}Hz`);
 
       source = audioContext.createMediaStreamSource(stream);
       processor = audioContext.createScriptProcessor(4096, 1, 1);
       gain = audioContext.createGain();
-      gain.gain.value = 0;
+      gain.gain.value = 0; // Mute local feedback
 
       processor.onaudioprocess = async (e) => {
-          // GATE 1: Se o sistema diz que está desconectado, nem processa
+          // GATEKEEPER 1: Verificação rápida
           if (!activeSessionPromise || !isConnected) return;
 
           const inputData = e.inputBuffer.getChannelData(0);
           
           try {
-              const pcmBuffer = downsampleAndConvertToPCM(inputData, streamRate);
+              // 1. Processamento de Áudio (Boost + Downsample)
+              const boosted = new Float32Array(inputData.length);
+              for (let i = 0; i < inputData.length; i++) boosted[i] = inputData[i] * 5.0; 
+
+              const pcmBuffer = downsampleAndConvertToPCM(boosted, streamRate);
               const base64Data = arrayBufferToBase64(pcmBuffer);
 
+              // 2. Envio Seguro (Race Condition Proof)
               activeSessionPromise.then(async (session) => {
-                 // GATE 2: Verifica novamente antes de enviar (Race Condition Protection)
+                 // GATEKEEPER 2: Verificação final pré-envio
                  if (!isConnected) return;
 
                  try {
-                     // Voltei para audio/pcm;rate=16000 para garantir que o server aceite
                      await session.sendRealtimeInput([{ 
                           mimeType: "audio/pcm;rate=16000",
                           data: base64Data
                       }]);
                  } catch (sendError: any) {
-                     // 🛡️ CATCH SILENCIOSO: Se o socket fechar durante o envio, ignoramos o erro
-                     // para não poluir o console ou crashar a app.
-                     if (sendError.message?.includes("CLOSING") || sendError.message?.includes("CLOSED")) {
-                         isConnected = false; // Força atualização do estado
+                     // SILENT CATCH: Ignora erros de "Socket Closed" durante transições
+                     if (sendError.message?.includes("CLOSING") || sendError.message?.includes("CLOSED") || !isConnected) {
+                         isConnected = false; 
                      } else {
-                         console.warn("Erro de envio não-crítico:", sendError);
+                         // Apenas loga se for erro real de payload
+                         console.warn("Drop de pacote de áudio (esperado em reconexão)");
                      }
                  }
-              }).catch(() => {});
+              }).catch(() => {
+                  // Catch da Promise do Session (raro, mas seguro)
+                  isConnected = false;
+              });
+
           } catch (err) {
-              console.error("Erro processamento áudio:", err);
+              console.error("Erro crítico processador:", err);
           }
       };
 
@@ -289,9 +328,9 @@ export const connectToLiveDebate = async (
 
   return {
        disconnect: async () => {
-           console.log("🛑 Encerrando...");
+           console.log("🛑 Finalizando Sessão...");
            shouldMaintainConnection = false;
-           isConnected = false; // Trava imediata
+           isConnected = false; // Killswitch
            
            if (source) source.disconnect();
            if (processor) processor.disconnect();
