@@ -3,7 +3,7 @@ import { Activity, ShieldCheck, AlertTriangle, Info, Play, Square, Trash2 } from
 import { AnalysisCard } from './components/AnalysisCard';
 import { TruthChart } from './components/TruthChart';
 import { AudioVisualizer } from './components/AudioVisualizer';
-import { connectToLiveDebate, analyzeStatement, LiveConnectionController, LiveStatus } from './services/geminiService'; // Adicionado analyzeStatement
+import { connectToLiveDebate, analyzeStatement, LiveConnectionController, LiveStatus } from './services/geminiService'; 
 import { logAnalysis, logSessionStart, logSessionEnd } from './services/loggingService';
 import { AnalysisResult, VerdictType } from './types';
 
@@ -13,7 +13,6 @@ function App() {
   const [isConnected, setIsConnected] = useState(false);
   const [currentTranscript, setCurrentTranscript] = useState("");
   
-  // Estado inicial tenta ler do localStorage
   const [analysisHistory, setAnalysisHistory] = useState<AnalysisResult[]>(() => {
     const saved = localStorage.getItem('debate_history');
     return saved ? JSON.parse(saved) : [];
@@ -27,7 +26,6 @@ function App() {
 
   const connectionRef = useRef<LiveConnectionController | null>(null);
   
-  // PERSISTÊNCIA
   useEffect(() => {
     localStorage.setItem('debate_history', JSON.stringify(analysisHistory));
     localStorage.setItem('debate_session_id', sessionId);
@@ -62,12 +60,9 @@ function App() {
         stream,
         (transcriptData) => {
           if (transcriptData.isFinal) {
-            // 1. Processa a frase finalizada
             processConfirmedSegment(transcriptData.text);
-            // 2. Limpa o buffer visual IMEDIATAMENTE para evitar duplicidade visual
             setCurrentTranscript(""); 
           } else {
-            // Atualiza o texto em tempo real (cinza)
             setCurrentTranscript(transcriptData.text);
           }
         },
@@ -118,13 +113,11 @@ function App() {
 
     const newSegmentId = generateId();
 
-    // 1. Cria Placeholder (Feedback Imediato na UI)
-    // Inserimos no COMEÇO do array ([new, ...old]) para aparecer no topo
     const placeholderItem: AnalysisResult = {
       segmentId: newSegmentId,
       verdict: VerdictType.UNVERIFIABLE,
       confidence: 0,
-      explanation: "🔍 Analisando veracidade...",
+      explanation: "🔍 Verificando fatos...",
       sources: [],
       sentimentScore: 0,
       logicalFallacies: [],
@@ -133,28 +126,24 @@ function App() {
 
     setAnalysisHistory(prev => [placeholderItem, ...prev]);
 
-    // 2. Dispara a Análise Real em Segundo Plano (Gemini Flash Check)
-    // Passamos as últimas 3 frases como contexto para ajudar a IA
-    const recentContext = analysisHistory.slice(0, 3).map(h => h.context?.[0] || "");
+    // AUMENTO DE CONTEXTO: Envia as últimas 10 frases para a IA ter noção do debate
+    const recentContext = analysisHistory.slice(0, 10).map(h => h.context?.[0] || "");
     
     try {
         const analysisResult = await analyzeStatement(text, newSegmentId, recentContext);
         
-        // 3. Atualiza o Card com o Resultado Real
         setAnalysisHistory(prev => prev.map(item => 
             item.segmentId === newSegmentId ? { ...analysisResult, context: [text] } : item
         ));
 
-        // 4. Loga no Banco de Dados
         await logAnalysis(sessionId, newSegmentId, text, analysisResult);
 
     } catch (error) {
         console.error("Erro na verificação:", error);
-        // Em caso de erro, atualiza para mostrar falha, não fica "analisando" pra sempre
         setAnalysisHistory(prev => prev.map(item => 
             item.segmentId === newSegmentId ? { 
                 ...item, 
-                explanation: "Falha técnica ao verificar este trecho." 
+                explanation: "Erro ao conectar com serviço de verificação." 
             } : item
         ));
     }
@@ -162,7 +151,6 @@ function App() {
 
   return (
     <div className="min-h-screen bg-slate-900 text-slate-100 font-sans selection:bg-blue-500 selection:text-white">
-      {/* Header */}
       <header className="border-b border-slate-800 bg-slate-950/50 backdrop-blur-md sticky top-0 z-50">
         <div className="container mx-auto px-4 h-16 flex items-center justify-between">
           <div className="flex items-center gap-2">
@@ -218,10 +206,7 @@ function App() {
       </header>
 
       <main className="container mx-auto px-4 py-6 grid grid-cols-1 lg:grid-cols-12 gap-6">
-        {/* Coluna Esquerda: Transcrição e Estatísticas */}
         <div className="lg:col-span-4 space-y-6 h-fit sticky top-24">
-          
-          {/* Visualizador de Áudio */}
           <div className="bg-slate-800/50 rounded-xl border border-slate-700 p-4 shadow-sm">
             <h2 className="text-sm font-semibold text-slate-400 mb-3 flex items-center gap-2">
               <Activity className="w-4 h-4" />
@@ -230,12 +215,10 @@ function App() {
             <AudioVisualizer stream={audioStream} isConnected={isConnected} />
           </div>
 
-          {/* Gráfico de Verdade */}
           <div className="bg-slate-800/50 rounded-xl border border-slate-700 p-4 shadow-sm">
              <TruthChart history={analysisHistory} />
           </div>
 
-          {/* Transcrição ao Vivo (Invertida: Novo no Topo) */}
           <div className="bg-slate-800/50 rounded-xl border border-slate-700 p-4 h-[400px] flex flex-col shadow-sm">
             <h2 className="text-sm font-semibold text-slate-400 mb-3 flex items-center gap-2">
               <Info className="w-4 h-4" />
@@ -243,15 +226,13 @@ function App() {
             </h2>
             
             <div className="flex-1 overflow-y-auto pr-2 font-mono text-sm leading-relaxed scrollbar-thin scrollbar-thumb-slate-600 scrollbar-track-transparent flex flex-col gap-3">
-               {/* 1. Texto atual (Buffer) no TOPO com destaque */}
                {currentTranscript && (
                    <div className="text-blue-300 animate-pulse border-l-2 border-blue-500 pl-2">
                        {currentTranscript}
                    </div>
                )}
 
-               {/* 2. Histórico recente logo abaixo (Do mais novo para o mais velho) */}
-               {analysisHistory.slice(0, 10).map((item, i) => (
+               {analysisHistory.slice(0, 15).map((item, i) => (
                    <p key={item.segmentId} className="text-slate-400 opacity-60 border-l-2 border-transparent pl-2 transition-all hover:opacity-100">
                        {item.context?.[0]}
                    </p>
@@ -260,7 +241,6 @@ function App() {
           </div>
         </div>
 
-        {/* Coluna Direita: Feed de Verificações (Novo no Topo) */}
         <div className="lg:col-span-8 space-y-4">
           <div className="flex items-center justify-between">
             <h2 className="text-lg font-semibold text-slate-200">Feed de Análise</h2>
@@ -276,7 +256,6 @@ function App() {
                 <p>Aguardando início do debate...</p>
               </div>
             ) : (
-              // Mapeia diretamente pois o array já está [Newest, ..., Oldest]
               analysisHistory.map((analysis) => (
                 <div key={analysis.segmentId} className="animate-in fade-in slide-in-from-top-4 duration-500">
                     <AnalysisCard result={analysis} />
