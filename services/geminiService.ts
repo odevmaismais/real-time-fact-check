@@ -1,4 +1,4 @@
-import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
+import { GoogleGenAI, LiveServerMessage, Modality, SchemaType } from "@google/genai";
 import { AnalysisResult, VerdictType } from "../types";
 
 const MODEL_NAME = "gemini-2.0-flash-exp";
@@ -51,7 +51,7 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
 }
 
 // -------------------------------------------
-// FACT CHECKING (Mantido)
+// FACT CHECKING
 // -------------------------------------------
 export const analyzeStatement = async (
   text: string,
@@ -131,7 +131,6 @@ export const connectToLiveDebate = async (
     return { disconnect: async () => {}, flush: () => {} };
   }
 
-  // [FIX] Clona o stream para evitar conflito com o Visualizer
   const stream = originalStream.clone();
   
   let shouldReconnect = true;
@@ -158,7 +157,6 @@ export const connectToLiveDebate = async (
 
   const connect = async () => {
       try {
-          // Reinicia AudioContext se necessário
           if (!audioContext || audioContext.state === 'closed') {
               audioContext = new AudioContext();
           }
@@ -170,18 +168,18 @@ export const connectToLiveDebate = async (
           activeSession = await ai.live.connect({
               model: LIVE_MODEL_NAME,
               config: {
-                  responseModalities: [Modality.AUDIO], // Mantém canal aberto
+                  responseModalities: [Modality.AUDIO], 
                   // @ts-ignore
                   inputAudioTranscription: {}, 
-                  // DEFINIÇÃO DA FERRAMENTA (O Segredo)
                   tools: [{
                       functionDeclarations: [{
                           name: "submit_transcript",
                           description: "Submit the transcribed text from the audio stream.",
                           parameters: {
-                              type: "OBJECT",
+                              // CORREÇÃO AQUI: Usando SchemaType
+                              type: SchemaType.OBJECT,
                               properties: {
-                                  text: { type: "STRING", description: "The transcribed text in Portuguese." }
+                                  text: { type: SchemaType.STRING, description: "The transcribed text in Portuguese." }
                               },
                               required: ["text"]
                           }
@@ -194,14 +192,12 @@ export const connectToLiveDebate = async (
               callbacks: {
                   onopen: () => onStatus?.({ type: 'info', message: "CONECTADO (AUTO-REC)" }),
                   onmessage: (msg: LiveServerMessage) => {
-                      // 1. Captura chamadas de função (Prioridade)
                       const fc = msg.serverContent?.modelTurn?.parts?.find(p => p.functionCall);
                       if (fc && fc.functionCall?.name === 'submit_transcript') {
                           const args = fc.functionCall.args as any;
                           if (args?.text) handleTranscriptText(args.text);
                       }
                       
-                      // 2. Captura texto direto (Backup)
                       const t1 = msg.serverContent?.inputTranscription?.text;
                       if (t1) handleTranscriptText(t1);
                   },
@@ -209,14 +205,13 @@ export const connectToLiveDebate = async (
                       console.log("⚠️ Conexão fechada:", e);
                       if (shouldReconnect) {
                           onStatus?.({ type: 'warning', message: "RECONECTANDO..." });
-                          setTimeout(connect, 100); // Reconecta instantaneamente
+                          setTimeout(connect, 100); 
                       }
                   },
                   onerror: (e) => console.error("Erro stream:", e)
               }
           });
 
-          // Configuração do Pipeline de Áudio
           if (!processor) {
               source = audioContext.createMediaStreamSource(stream);
               processor = audioContext.createScriptProcessor(4096, 1, 1);
@@ -226,15 +221,12 @@ export const connectToLiveDebate = async (
 
                   const inputData = e.inputBuffer.getChannelData(0);
                   
-                  // Debug de Vida: Se não aparecer, o navegador matou o processamento
                   if (Math.random() < 0.05) console.log("💓 Audio Pulse (Processing)");
 
-                  // Boost Volume (5x)
                   const boosted = new Float32Array(inputData.length);
                   for (let i = 0; i < inputData.length; i++) boosted[i] = inputData[i] * 5.0;
 
                   try {
-                      // Downsample 48k -> 16k para compatibilidade máxima
                       const pcm16k = downsampleTo16k(boosted, streamRate);
                       const base64Data = arrayBufferToBase64(pcm16k.buffer as ArrayBuffer);
                       
@@ -243,12 +235,11 @@ export const connectToLiveDebate = async (
                           data: base64Data
                       }]);
                   } catch (err) {
-                      // Ignora erro de envio se a sessão estiver caindo
                   }
               };
 
               source.connect(processor);
-              processor.connect(audioContext.destination); // Necessário para manter vivo no Chrome
+              processor.connect(audioContext.destination); 
           }
  
       } catch (err: any) {
@@ -257,7 +248,6 @@ export const connectToLiveDebate = async (
       }
   };
 
-  // Inicia primeira conexão
   connect();
 
   return {
@@ -268,7 +258,7 @@ export const connectToLiveDebate = async (
           if (source) source.disconnect();
           if (processor) processor.disconnect();
           if (audioContext) await audioContext.close();
-          stream.getTracks().forEach(t => t.stop()); // Para o clone
+          stream.getTracks().forEach(t => t.stop()); 
       },
       flush: () => { currentBuffer = ""; }
   };
