@@ -18,8 +18,7 @@ export interface LiveConnectionController {
 }
 
 // --- AUDIO WORKLET CODE (INLINE) ---
-// Mantido o seu código original que FUNCIONA (Box Filter + Tanh Boost)
-// Isso garante volume suficiente para o VAD do Gemini ativar.
+// Mantido o código Híbrido (Box Filter + Tanh Boost) que validamos funcionar
 const PCM_PROCESSOR_CODE = `
 class PCMProcessor extends AudioWorkletProcessor {
   constructor() {
@@ -34,7 +33,8 @@ class PCMProcessor extends AudioWorkletProcessor {
     if (!input || !input[0]) return true;
     
     const inputChannel = input[0];
-    const ratio = sampleRate / this.targetRate;
+    const inputRate = sampleRate;
+    const ratio = inputRate / this.targetRate;
     
     let inputIndex = 0;
     
@@ -78,8 +78,6 @@ registerProcessor('pcm-processor', PCMProcessor);
 
 // --- UTILS ---
 
-// ATENÇÃO: Esta função remove espaços extras. Só deve ser usada na exibição final,
-// nunca na concatenação do buffer de stream.
 const cleanTranscriptText = (text: string): string => {
   if (!text) return "";
   return text.replace(/\s+/g, ' ').trim();
@@ -95,7 +93,7 @@ function arrayBufferToBase64(buffer: ArrayBuffer | SharedArrayBuffer): string {
     return window.btoa(binary);
 }
 
-// --- FACT CHECKING (Mantido) ---
+// --- FACT CHECKING (CORRIGIDO) ---
 export const analyzeStatement = async (
   text: string,
   segmentId: string,
@@ -123,7 +121,12 @@ export const analyzeStatement = async (
       },
     });
 
-    const jsonText = response.text || "{}"; 
+    // --- CORREÇÃO DO ERRO JSON ---
+    let jsonText = response.text || "{}";
+    
+    // Remove marcadores de Markdown (```json ... ```) se existirem
+    jsonText = jsonText.replace(/```json/g, "").replace(/```/g, "").trim();
+
     const data = JSON.parse(jsonText);
     const sources = response.candidates?.[0]?.groundingMetadata?.groundingChunks
       ?.map((chunk: any) => chunk.web)
@@ -226,13 +229,10 @@ export const connectToLiveDebate = async (
       activeSessionPromise.then(async (session) => {
           if (connectionState !== 'CONNECTED') return;
           try {
-              // Envia objeto formatado corretamente { media: ... }
-              await session.sendRealtimeInput({ 
-                  media: {
-                      mimeType: "audio/pcm;rate=16000", 
-                      data: base64Data
-                  }
-              });
+              await session.sendRealtimeInput([{ 
+                  mimeType: "audio/pcm;rate=16000", 
+                  data: base64Data
+              }]);
           } catch (e: any) {
               if (e.message && (e.message.includes("CLOSING") || e.message.includes("CLOSED"))) return;
               console.warn("Tx Error:", e);
@@ -251,10 +251,8 @@ export const connectToLiveDebate = async (
           model: LIVE_MODEL_NAME, 
           config: {
             responseModalities: [Modality.TEXT], 
-            
             // @ts-ignore
             inputAudioTranscription: { }, 
-            
             systemInstruction: {
                 parts: [{ text: "Transcreva o áudio para Português do Brasil (PT-BR) imediatamente. Transcrição verbatim: palavra por palavra." }]
             },
@@ -308,23 +306,14 @@ export const connectToLiveDebate = async (
     }
   };
 
-  // --- CORREÇÃO DO PICOTADO (TEXT HANDLING) ---
   let currentBuffer = "";
-  
   const handleText = (raw: string) => {
-      // 1. NÃO usamos cleanTranscriptText(raw) aqui.
-      // O Gemini envia pedaços como " ca" (com espaço) ou "sa" (sem espaço) que colam perfeitamente.
-      // Se limparmos antes, perdemos a cola.
-      
+      // Mantendo a lógica que corrigiu o texto picotado
       if (raw) {
-          console.log("📝 Chunk Puro:", `"${raw}"`); // Debug para ver os espaços
+          console.log("📝 Chunk Puro:", `"${raw}"`); 
           currentBuffer += raw; 
-          
-          // 2. Enviamos para UI com trim() apenas visual
-          // O `onTranscript` da UI pode fazer o que quiser, mas o `currentBuffer` mantém a integridade
           onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: false });
           
-          // 3. Detecção de fim de frase
           if (currentBuffer.length > 150 || raw.match(/[.!?]$/)) {
               onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: true });
               currentBuffer = "";
