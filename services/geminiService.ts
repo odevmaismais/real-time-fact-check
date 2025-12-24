@@ -18,14 +18,14 @@ export interface LiveConnectionController {
 }
 
 // --- AUDIO WORKLET CODE (INLINE) ---
-// Processador com Interpolação Linear para áudio suave (High Quality Resampling)
+// Versão SIMPLIFICADA e ROBUSTA (Stateless)
+// Focada em garantir que o áudio chegue sem falhas (evita o silêncio da interpolação complexa)
 const PCM_PROCESSOR_CODE = `
 class PCMProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
     this.buffer = new Int16Array(4096); 
     this.bufferIndex = 0;
-    this.targetRate = 16000;
   }
 
   process(inputs, outputs, parameters) {
@@ -34,37 +34,27 @@ class PCMProcessor extends AudioWorkletProcessor {
     
     const inputChannel = input[0];
     const inputRate = sampleRate;
+    const targetRate = 16000;
+    const ratio = inputRate / targetRate;
     
-    // Fator de passo para o downsample
-    const step = inputRate / this.targetRate;
-    let sourceIndex = 0;
+    // Cálculo seguro de quantas amostras gerar neste ciclo
+    const newSamples = Math.floor(inputChannel.length / ratio);
     
-    // Loop de processamento com Interpolação Linear
-    // Isso evita o aliasing e a "voz robótica" que confunde a IA
-    while (sourceIndex < inputChannel.length - 1) {
-       const indexFloor = Math.floor(sourceIndex);
-       const indexCeil = indexFloor + 1;
-       const fraction = sourceIndex - indexFloor;
+    for (let i = 0; i < newSamples; i++) {
+        const offset = Math.floor(i * ratio);
+        const val = inputChannel[offset];
 
-       const sample1 = inputChannel[indexFloor];
-       const sample2 = inputChannel[indexCeil];
-
-       // Fórmula de Interpolação: Weighted Average
-       const val = sample1 + fraction * (sample2 - sample1);
-       
-       // Clamp para evitar distorção (-1 a 1)
-       const s = Math.max(-1, Math.min(1, val));
-       
-       // Conversão PCM Int16
-       const pcm = s < 0 ? s * 0x8000 : s * 0x7FFF;
-       
-       if (this.bufferIndex >= this.buffer.length) {
-           this.port.postMessage(this.buffer.slice(0, this.bufferIndex));
-           this.bufferIndex = 0;
-       }
-       
-       this.buffer[this.bufferIndex++] = pcm;
-       sourceIndex += step;
+        // Processamento simples e seguro (Clamp + Conversão)
+        const s = Math.max(-1, Math.min(1, val));
+        const pcm = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        
+        // Flush do buffer se encher
+        if (this.bufferIndex >= this.buffer.length) {
+            this.port.postMessage(this.buffer.slice(0, this.bufferIndex));
+            this.bufferIndex = 0;
+        }
+        
+        this.buffer[this.bufferIndex++] = pcm;
     }
     return true;
   }
@@ -74,6 +64,7 @@ registerProcessor('pcm-processor', PCMProcessor);
 
 // --- UTILS ---
 
+// ATENÇÃO: Usar apenas para limpar o output FINAL, não durante a montagem do stream
 const cleanTranscriptText = (text: string): string => {
   if (!text) return "";
   return text.replace(/\s+/g, ' ').trim();
@@ -205,7 +196,7 @@ export const connectToLiveDebate = async (
           sourceNode.connect(workletNode);
           workletNode.connect(audioContext.destination); 
           
-          console.log("🔊 Audio Worklet Initialized (Linear Interpolation)");
+          console.log("🔊 Audio Worklet Initialized (Standard Mode)");
 
       } catch (e) {
           console.error("Falha ao iniciar Audio Engine", e);
@@ -251,13 +242,13 @@ export const connectToLiveDebate = async (
             inputAudioTranscription: { }, 
             
             systemInstruction: {
-                // Instrução focada em QUALIDADE e COESÃO, não apenas velocidade
-                parts: [{ text: "You are an expert audio transcriber. Your goal is to generate coherent, grammatically correct Portuguese text. Join fragmented words and fix disfluencies. Output clear, readable text stream." }]
+                // Instrução equilibrada: pede tempo real mas com precisão
+                parts: [{ text: "You are a precise real-time transcriber. Transcribe the Portuguese audio stream exactly as spoken. Output words as soon as they are recognized." }]
             },
           },
           callbacks: {
             onopen: () => {
-               console.log("🟢 Conectado (Quality Mode)");
+               console.log("🟢 Conectado (Real-Time Text Mode)");
                connectionState = 'CONNECTED';
                onStatus?.({ type: 'info', message: "ONLINE" });
             },
@@ -305,13 +296,19 @@ export const connectToLiveDebate = async (
   // Handlers de Texto
   let currentBuffer = "";
   const handleText = (raw: string) => {
-      const text = cleanTranscriptText(raw);
-      if (text.length > 0) {
-          console.log("📝 Texto:", text); 
-          currentBuffer += " " + text;
+      // FIX CRÍTICO PARA O TEXTO "PICOTADO":
+      // Não fazemos trim() nem adicionamos espaço forçado.
+      // O Gemini envia " ca" (com espaço) ou "sa" (sem espaço) para completar a palavra.
+      // Respeitar o 'raw' resolve a quebra de palavras.
+      if (raw) {
+          console.log("📝 Chunk:", raw); 
+          currentBuffer += raw; 
+          
+          // Enviamos para a UI com um trim apenas na visualização, não no buffer interno
           onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: false });
           
-          if (currentBuffer.length > 80 || text.match(/[.!?]$/)) {
+          // Detecta final de frase para limpar buffer e enviar para análise
+          if (currentBuffer.length > 80 || raw.match(/[.!?]$/)) {
               onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: true });
               currentBuffer = "";
           }
