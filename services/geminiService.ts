@@ -1,4 +1,4 @@
-import { GoogleGenAI, LiveServerMessage, Modality, FunctionDeclaration, Type } from "@google/genai";
+import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
 import { AnalysisResult, VerdictType } from "../types";
 
 const MODEL_NAME = "gemini-2.0-flash-exp";
@@ -16,38 +16,11 @@ const cleanTranscriptText = (text: string): string => {
   return text.replace(/\s+/g, ' ').trim();
 };
 
-function downsampleTo16k(input: Float32Array, inputRate: number): Int16Array {
-    if (inputRate === 16000) {
-        return floatTo16BitPCM(input);
-    }
-    const ratio = inputRate / 16000;
-    const newLength = Math.ceil(input.length / ratio);
-    const output = new Int16Array(newLength);
-    
-    for (let i = 0; i < newLength; i++) {
-        const offset = Math.floor(i * ratio);
-        const val = input[Math.min(offset, input.length - 1)];
-        const s = Math.max(-1, Math.min(1, val));
-        output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-    }
-    return output;
-}
-
-function floatTo16BitPCM(input: Float32Array): Int16Array {
-    const output = new Int16Array(input.length);
-    for (let i = 0; i < input.length; i++) {
-        const s = Math.max(-1, Math.min(1, input[i]));
-        output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-    }
-    return output;
-}
-
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
     let binary = '';
     const bytes = new Uint8Array(buffer);
     const len = bytes.byteLength;
     const chunkSize = 0x8000; 
-    
     for (let i = 0; i < len; i += chunkSize) {
         const chunk = bytes.subarray(i, Math.min(i + chunkSize, len));
         binary += String.fromCharCode.apply(null, Array.from(chunk));
@@ -148,27 +121,29 @@ export const connectToLiveDebate = async (
   
   const ai = new GoogleGenAI({ apiKey });
   
+  // Usar AudioContext sem sampleRate fixo (deixa o navegador decidir, geralmente 44.1k ou 48k)
+  // Isso evita overhead de processamento no JS
   const audioContext = new AudioContext(); 
   if (audioContext.state === 'suspended') await audioContext.resume();
 
   const source = audioContext.createMediaStreamSource(stream);
   const processor = audioContext.createScriptProcessor(4096, 1, 1);
   const gain = audioContext.createGain();
-  gain.gain.value = 0; // Mute local output
+  gain.gain.value = 0; 
   
   let currentBuffer = "";
   let isConnected = false;
   let activeSession: any = null;
   
-  // Buffer e Acumuladores de Áudio
+  // Buffer Acumulador para estabilidade de rede
   let audioAccumulator: Float32Array = new Float32Array(0);
-  const CHUNK_THRESHOLD = 3; 
+  const CHUNK_THRESHOLD = 2; // Acumula 2 chunks antes de enviar
   let chunkCounter = 0;
 
   const handleText = (raw: string) => {
       const text = cleanTranscriptText(raw);
       if (text.length > 0) {
-          console.log("📝 TRANSCRITO:", text);
+          console.log("📝 RECEBIDO:", text);
           currentBuffer += " " + text;
           onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: false });
           
@@ -179,41 +154,24 @@ export const connectToLiveDebate = async (
       }
   };
 
-  // 1. TOOL DEFINITION
-  const transcriptTool: FunctionDeclaration = {
-      name: "submit_transcript",
-      description: "Submits the raw text transcription of the audio heard.",
-      parameters: {
-          type: Type.OBJECT,
-          properties: {
-              text: {
-                  type: Type.STRING,
-                  description: "The exact Portuguese text transcribed from the audio."
-              }
-          },
-          required: ["text"]
-      }
-  };
-
   try {
     const streamRate = audioContext.sampleRate;
-    console.log(`🎤 Iniciando (Function Calling Mode): Input=${streamRate}Hz`);
+    console.log(`🎤 Iniciando Stream: ${streamRate}Hz (Nativo)`);
 
     activeSession = await ai.live.connect({
       model: LIVE_MODEL_NAME,
       config: {
-        responseModalities: [Modality.AUDIO], // Mantém a conexão viva
-        speechConfig: {
-            voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
-        },
-        // 2. SYSTEM INSTRUCTION ESTRATÉGICA
-        systemInstruction: {
-            parts: [{ text: "You are a dedicated transcription agent. Your ONLY job is to listen to the Portuguese audio and IMMEDIATELLY call the function `submit_transcript` passing the exact transcribed text. Do not reply with audio. Do not summarize. Just transcribe." }]
-        },
-        tools: [{ functionDeclarations: [transcriptTool] }],
-        // Backup: ativa transcrição passiva caso o function calling falhe
+        // AUDIO mantém a conexão aberta esperando "conversa"
+        responseModalities: [Modality.AUDIO], 
+        
+        // Ativa o eco do usuário (nossa principal fonte de transcrição)
         // @ts-ignore
         inputAudioTranscription: {}, 
+        
+        systemInstruction: {
+            // Instrução "Echo Bot" - Repetir o que ouve força o modelo a processar o texto
+            parts: [{ text: "Repita EXATAMENTE o que você ouvir em Português. Não traduza. Não responda. Apenas repita." }]
+        }
       },
       callbacks: {
         onopen: () => {
@@ -222,36 +180,13 @@ export const connectToLiveDebate = async (
            onStatus?.({ type: 'info', message: "ESCUTANDO..." });
         },
         onmessage: (msg: LiveServerMessage) => {
-           // 3. PROCESSAMENTO DE FUNCTION CALL
-           const parts = msg.serverContent?.modelTurn?.parts;
-           if (parts) {
-               for (const part of parts) {
-                   if (part.functionCall) {
-                       const fc = part.functionCall;
-                       if (fc.name === 'submit_transcript') {
-                           const args = fc.args as any;
-                           if (args && args.text) {
-                               handleText(args.text);
-                           }
-
-                           // IMPORTANTE: Enviar resposta da tool para completar o turno
-                           activeSession.sessionPromise.then(async () => {
-                                await activeSession.sendToolResponse({
-                                    functionResponses: [{
-                                        id: fc.id,
-                                        name: fc.name,
-                                        response: { result: "ok" }
-                                    }]
-                                });
-                           });
-                       }
-                   }
-               }
-           }
-
-           // Backup: Transcrição passiva nativa
-           const tInput = msg.serverContent?.inputTranscription?.text;
-           if (tInput) handleText(tInput);
+           // 1. Fonte Primária: O que o modelo "entendeu" do áudio (User Echo)
+           const t1 = msg.serverContent?.inputTranscription?.text;
+           // 2. Fonte Secundária: O que o modelo "vai repetir" (Model Response)
+           const t2 = msg.serverContent?.modelTurn?.parts?.[0]?.text;
+           
+           if (t1) handleText(t1);
+           if (t2) handleText(t2);
            
            if (msg.serverContent?.turnComplete && currentBuffer) {
                onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: true });
@@ -277,15 +212,12 @@ export const connectToLiveDebate = async (
 
       const inputData = e.inputBuffer.getChannelData(0);
       
-      // Boost de Volume
+      // Boost de Volume (3x) - Menos agressivo, mas suficiente
       const boosted = new Float32Array(inputData.length);
-      let vol = 0;
       for (let i = 0; i < inputData.length; i++) {
-          boosted[i] = inputData[i] * 5.0;
-          vol += Math.abs(inputData[i]);
+          boosted[i] = inputData[i] * 3.0;
       }
 
-      // Bufferização
       const temp = new Float32Array(audioAccumulator.length + boosted.length);
       temp.set(audioAccumulator);
       temp.set(boosted, audioAccumulator.length);
@@ -293,20 +225,17 @@ export const connectToLiveDebate = async (
       chunkCounter++;
 
       if (chunkCounter >= CHUNK_THRESHOLD) {
-          if(vol > 0.01) {
-              // console.log("📡 Enviando Buffer..."); 
-          }
-          
           try {
-              const pcm16k = downsampleTo16k(audioAccumulator, streamRate);
-              const base64Data = arrayBufferToBase64(pcm16k.buffer as ArrayBuffer);
+              // ENVIO NA TAXA NATIVA (SEM DOWNSAMPLE)
+              // O Gemini 2.0 Flash lida bem com 48kHz se o cabeçalho estiver certo.
+              const base64Data = arrayBufferToBase64(audioAccumulator.buffer as ArrayBuffer);
 
               await activeSession.sendRealtimeInput([{ 
-                  mimeType: "audio/pcm;rate=16000",
+                  mimeType: `audio/pcm;rate=${streamRate}`,
                   data: base64Data
               }]);
           } catch (err) {
-              // Silencioso para não poluir logs
+              // Ignora erros de rede
           } finally {
               audioAccumulator = new Float32Array(0);
               chunkCounter = 0;
