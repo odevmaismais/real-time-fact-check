@@ -16,53 +16,36 @@ const cleanTranscriptText = (text: string): string => {
   return text.replace(/\s+/g, ' ').trim();
 };
 
-/**
- * Converte Float32 (Navegador) para Int16 (PCM) E faz o Downsample para 16kHz.
- */
 function downsampleAndConvertToPCM(input: Float32Array, inputRate: number): ArrayBuffer {
     const targetRate = 16000;
-    
-    // Se já for 16k, apenas converte
     if (inputRate === targetRate) {
         const buffer = new ArrayBuffer(input.length * 2);
         const view = new DataView(buffer);
         for (let i = 0; i < input.length; i++) {
             const s = Math.max(-1, Math.min(1, input[i]));
             const val = s < 0 ? s * 0x8000 : s * 0x7FFF;
-            view.setInt16(i * 2, val, true); // Little Endian
+            view.setInt16(i * 2, val, true);
         }
         return buffer;
     }
-
-    // Cálculo de Downsample simples
     const ratio = inputRate / targetRate;
     const newLength = Math.ceil(input.length / ratio);
     const buffer = new ArrayBuffer(newLength * 2);
     const view = new DataView(buffer);
-    
     for (let i = 0; i < newLength; i++) {
         const offset = Math.floor(i * ratio);
         const valFloat = input[Math.min(offset, input.length - 1)];
-        
-        // Clamp e Conversão
         const s = Math.max(-1, Math.min(1, valFloat));
         const valInt = s < 0 ? s * 0x8000 : s * 0x7FFF;
-        
-        view.setInt16(i * 2, valInt, true); // Little Endian
+        view.setInt16(i * 2, valInt, true);
     }
     return buffer;
 }
 
-/**
- * OTIMIZAÇÃO: Conversão iterativa robusta para Base64.
- * Evita "Maximum call stack size exceeded" causados por spread operators ou .apply em arrays grandes.
- */
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
     let binary = '';
     const bytes = new Uint8Array(buffer);
     const len = bytes.byteLength;
-    
-    // Processamento iterativo seguro
     for (let i = 0; i < len; i++) {
         binary += String.fromCharCode(bytes[i]);
     }
@@ -70,7 +53,7 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
 }
 
 // -------------------------------------------
-// FACT CHECKING (Mantido Igual)
+// FACT CHECKING (REST)
 // -------------------------------------------
 export const analyzeStatement = async (
   text: string,
@@ -137,7 +120,7 @@ export const analyzeStatement = async (
 };
 
 // -------------------------------------------
-// CONEXÃO LIVE (Otimizada)
+// CONEXÃO LIVE (Websocket Seguro)
 // -------------------------------------------
 
 export interface LiveConnectionController {
@@ -161,6 +144,10 @@ export const connectToLiveDebate = async (
   
   let shouldMaintainConnection = true;
   let activeSessionPromise: Promise<any> | null = null;
+  
+  // NOVA FLAG DE CONTROLE DE ESTADO
+  let isConnected = false;
+
   let audioContext: AudioContext | null = null;
   let source: MediaStreamAudioSourceNode | null = null;
   let processor: ScriptProcessorNode | null = null;
@@ -190,19 +177,13 @@ export const connectToLiveDebate = async (
     onStatus?.({ type: 'info', message: "CONECTANDO..." });
 
     try {
-        let sessionPromise: Promise<any>;
-
-        sessionPromise = ai.live.connect({
+        const sessionPromise = ai.live.connect({
           model: LIVE_MODEL_NAME,
           config: {
             responseModalities: [Modality.TEXT], 
-            
-            // CORREÇÃO CRÍTICA: O modelo PRECISA ser especificado para habilitar o ASR.
-            // Passar um objeto vazio {} desabilita o processamento de áudio.
             inputAudioTranscription: {
                 model: LIVE_MODEL_NAME 
             },
-            
             systemInstruction: {
                 parts: [{ text: "Transcreva o áudio para Português. Seja preciso." }]
             },
@@ -210,40 +191,42 @@ export const connectToLiveDebate = async (
           callbacks: {
             onopen: () => {
                console.log("🟢 Conectado (ASR Enabled)!");
+               isConnected = true; // ATIVAR ENVIO
                onStatus?.({ type: 'info', message: "ESCUTANDO" });
                reconnectCount = 0;
             },
             onmessage: (msg: LiveServerMessage) => {
                const t1 = msg.serverContent?.inputTranscription?.text;
                const t2 = msg.serverContent?.modelTurn?.parts?.[0]?.text;
-               
-               if (t1) {
-                   handleText(t1);
-               }
-               if (t2) {
-                   handleText(t2);
-               }
+               if (t1) handleText(t1);
+               if (t2) handleText(t2);
             },
             onclose: (e) => {
+               isConnected = false; // PARAR ENVIO IMEDIATAMENTE
+               console.log("🔴 Conexão Fechada");
                if (shouldMaintainConnection) {
-                   console.log("🔄 Reconectando (CloseEvent)...");
-                   setTimeout(establishConnection, 100); 
+                   console.log("🔄 Reconectando em 1s...");
+                   setTimeout(establishConnection, 1000); 
                }
             },
-            onerror: (err) => console.error("🔴 Erro Socket:", err)
+            onerror: (err) => {
+                isConnected = false;
+                console.error("🔴 Erro Socket:", err);
+            }
           }
         });
 
         activeSessionPromise = sessionPromise;
 
         sessionPromise.catch(err => {
+            isConnected = false;
             if (shouldMaintainConnection) {
-                console.log("🔄 Reconectando (Promise Error)...");
                 setTimeout(establishConnection, 1000); 
             }
         });
 
     } catch (err) {
+        isConnected = false;
         if (shouldMaintainConnection) setTimeout(establishConnection, 1000);
     }
   };
@@ -258,29 +241,33 @@ export const connectToLiveDebate = async (
       console.log(`🎤 Input Rate: ${streamRate}Hz -> Convertendo para 16000Hz`);
 
       source = audioContext.createMediaStreamSource(stream);
-      // 4096 amostras = ~256ms de áudio em 16kHz, bom equilíbrio latência/performance
       processor = audioContext.createScriptProcessor(4096, 1, 1);
       gain = audioContext.createGain();
       gain.gain.value = 0;
 
       processor.onaudioprocess = async (e) => {
-          if (!activeSessionPromise) return;
+          // VERIFICAÇÃO RIGOROSA: Se não estiver conectado, não faz nada.
+          if (!activeSessionPromise || !isConnected) return;
 
           const inputData = e.inputBuffer.getChannelData(0);
           
           try {
-              // 1. Downsample e Conversão PCM rigorosa
-              // SEM BOOST: Passamos inputData diretamente
               const pcmBuffer = downsampleAndConvertToPCM(inputData, streamRate);
-              
-              // 2. Conversão Otimizada para Base64 (sem estourar a stack)
               const base64Data = arrayBufferToBase64(pcmBuffer);
 
               activeSessionPromise.then(async (session) => {
-                 await session.sendRealtimeInput([{ 
-                      mimeType: "audio/pcm", // Simplificado para garantir compatibilidade
-                      data: base64Data
-                  }]);
+                 // SEGUNDA VERIFICAÇÃO: A conexão pode ter caído enquanto o Promise resolvia
+                 if (!isConnected) return;
+
+                 try {
+                     await session.sendRealtimeInput([{ 
+                          mimeType: "audio/pcm",
+                          data: base64Data
+                      }]);
+                 } catch (sendError) {
+                     // Ignora erros de envio isolados para não poluir o log
+                     // Se for erro crítico, o onclose/onerror vai lidar
+                 }
               }).catch(() => {});
           } catch (err) {
               console.error("Erro processamento áudio:", err);
@@ -298,9 +285,12 @@ export const connectToLiveDebate = async (
        disconnect: async () => {
            console.log("🛑 Encerrando...");
            shouldMaintainConnection = false;
+           isConnected = false; // Trava imediata
+           
            if (source) source.disconnect();
            if (processor) processor.disconnect();
            if (gain) gain.disconnect();
+           
            if (activeSessionPromise) {
                try {
                    const session = await activeSessionPromise;
