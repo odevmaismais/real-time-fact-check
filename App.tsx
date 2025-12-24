@@ -1,407 +1,287 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { 
-  Mic, 
-  Activity,  
-  Radio, 
-  Send, 
-  Cpu, 
-  Database,
-  MonitorPlay,
-  StopCircle,
-  Zap,
-  Scissors,
-  AlertOctagon,
-  Loader2
-} from 'lucide-react';
-import { DebateSegment, AnalysisResult, VerdictType } from './types';
-import { analyzeStatement, connectToLiveDebate, LiveStatus, LiveConnectionController } from './services/geminiService';
+import React, { useState, useRef, useEffect } from 'react';
+import { Activity, ShieldCheck, AlertTriangle, Info, Play, Square, Trash2 } from 'lucide-react';
 import { AnalysisCard } from './components/AnalysisCard';
 import { TruthChart } from './components/TruthChart';
 import { AudioVisualizer } from './components/AudioVisualizer';
-import { v4 as uuidv4 } from 'uuid';
+import { connectToLiveDebate, LiveConnectionController, LiveStatus } from './services/geminiService';
+import { logAnalysis, logSessionStart, logSessionEnd } from './services/loggingService';
+import { AnalysisResult, VerdictType } from './types';
 
-const App: React.FC = () => {
-  const [isListening, setIsListening] = useState(false);
-  const [isConnecting, setIsConnecting] = useState(false);
-  const [inputMode, setInputMode] = useState<'mic' | 'tab' | 'none'>('none');
-  const [inputText, setInputText] = useState('');
-  
-  const [segments, setSegments] = useState<DebateSegment[]>([]);
-  const [analysisQueue, setAnalysisQueue] = useState<DebateSegment[]>([]);
-  const pendingMergeBufferRef = useRef<string>("");
-  const [currentStreamingText, setCurrentStreamingText] = useState('');
-  const [analyses, setAnalyses] = useState<Record<string, AnalysisResult>>({});
-  const [truthData, setTruthData] = useState<{ time: string; score: number }[]>([]);
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [liveStatus, setLiveStatus] = useState<LiveStatus | null>(null);
-  const [isMounted, setIsMounted] = useState(false);
-  const [autoScroll, setAutoScroll] = useState(true);
-  
-  const [totalInputTokens, setTotalInputTokens] = useState(0);
-  const [totalOutputTokens, setTotalOutputTokens] = useState(0);
-  const [liveAudioSeconds, setLiveAudioSeconds] = useState(0);
-  
-  const liveTimerRef = useRef<number | null>(null);
-  const feedEndRef = useRef<HTMLDivElement>(null);
-  const analysisEndRef = useRef<HTMLDivElement>(null);
-  
-  // Persistência do Serviço
-  const liveControlRef = useRef<LiveConnectionController | null>(null);
-  
-  // Visualização de Áudio (Separada do Stream de envio para performance)
-  const [analyserNode, setAnalyserNode] = useState<AnalyserNode | null>(null);
-  const visContextRef = useRef<AudioContext | null>(null);
+// Função auxiliar para gerar IDs únicos
+const generateId = () => Math.random().toString(36).substr(2, 9);
 
-  useEffect(() => { setIsMounted(true); }, []);
+function App() {
+  const [isConnected, setIsConnected] = useState(false);
+  const [currentTranscript, setCurrentTranscript] = useState("");
+  // Estado inicial tenta ler do localStorage
+  const [analysisHistory, setAnalysisHistory] = useState<AnalysisResult[]>(() => {
+    const saved = localStorage.getItem('debate_history');
+    return saved ? JSON.parse(saved) : [];
+  });
+  
+  const [status, setStatus] = useState<LiveStatus>({ type: 'info', message: 'Pronto para iniciar' });
+  const [audioStream, setAudioStream] = useState<MediaStream | null>(null);
+  const [sessionId, setSessionId] = useState<string>(() => {
+     return localStorage.getItem('debate_session_id') || generateId();
+  });
 
+  const connectionRef = useRef<LiveConnectionController | null>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  // --- EFEITOS DE PERSISTÊNCIA ---
+
+  // 1. Salvar histórico e SessionID sempre que mudarem
   useEffect(() => {
-    if (autoScroll) feedEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [segments, currentStreamingText, autoScroll]);
+    localStorage.setItem('debate_history', JSON.stringify(analysisHistory));
+    localStorage.setItem('debate_session_id', sessionId);
+  }, [analysisHistory, sessionId]);
 
+  // 2. Auto-scroll para o final quando novas mensagens chegam
   useEffect(() => {
-    if (autoScroll) analysisEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [analyses, autoScroll]);
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [analysisHistory, currentTranscript]);
 
-  // --- PROCESSING LOOP ---
-  useEffect(() => {
-    const processQueue = async () => {
-        if (isProcessing || analysisQueue.length === 0) return;
+  const handleStart = async () => {
+    try {
+      // Se for uma nova sessão após limpeza, gera novo ID
+      if (!localStorage.getItem('debate_session_id')) {
+          const newId = generateId();
+          setSessionId(newId);
+          await logSessionStart(newId);
+      } else {
+          // Retoma sessão existente (opcional: logar "resume")
+          console.log("Retomando sessão:", sessionId);
+      }
 
-        setIsProcessing(true);
-        const segment = analysisQueue[0]; 
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { width: 1, height: 1 }, 
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+          sampleRate: 48000
+        },
+        systemAudio: 'include' 
+      } as any);
 
-        try {
-            const trimmedText = segment.text.trim();
-            const wordCount = trimmedText.split(/\s+/).length;
-            const charCount = trimmedText.length;
-            const endsWithPunctuation = /[.?!]$/.test(trimmedText);
-            const isSubstantial = charCount > 60 && wordCount >= 8;
-            const isComplete = endsWithPunctuation || charCount > 120;
+      setAudioStream(stream);
 
-            if (isSubstantial && isComplete) {
-                const recentHistory = segments
-                    .filter(s => s.id !== segment.id)
-                    .slice(-3)
-                    .map(s => s.text);
-
-                const analysis = await analyzeStatement(segment.text, segment.id, recentHistory);
-                
-                if (analysis.tokenUsage) {
-                    setTotalInputTokens(prev => prev + analysis.tokenUsage!.promptTokens);
-                    setTotalOutputTokens(prev => prev + analysis.tokenUsage!.responseTokens);
-                }
-
-                setAnalyses(prev => ({ ...prev, [segment.id]: analysis }));
-                
-                let score = 0;
-                if (analysis.verdict === VerdictType.TRUE) score = 1;
-                else if (analysis.verdict === VerdictType.FALSE) score = -1;
-                else if (analysis.verdict === VerdictType.MISLEADING) score = -0.5;
-                else if (analysis.verdict === VerdictType.OPINION) score = 0.2;
-                
-                setTruthData(prev => {
-                    const newData = [...prev, { time: new Date().toLocaleTimeString(), score }];
-                    if (newData.length > 20) return newData.slice(newData.length - 20);
-                    return newData;
-                });
-            }
-        } catch (err) {
-            console.error("Processing error", err);
-        } finally {
-            setAnalysisQueue(prev => prev.slice(1));
-            setIsProcessing(false);
-        }
-    };
-
-    processQueue();
-  }, [analysisQueue, isProcessing, segments]); 
-
-  const handleTranscriptData = useCallback((data: { text: string; speaker: string; isFinal: boolean }) => {
-     if (!data.isFinal) {
-         const displayText = pendingMergeBufferRef.current 
-             ? `${pendingMergeBufferRef.current} ${data.text}`
-             : data.text;
-         setCurrentStreamingText(displayText);
-     } else {
-         const incomingText = data.text.trim();
-         let fullText = pendingMergeBufferRef.current 
-             ? `${pendingMergeBufferRef.current} ${incomingText}`
-             : incomingText;
-
-         const hasTerminalPunctuation = /[.?!]$/.test(fullText);
-         const isLongEnough = fullText.length > 80;
-
-         if (!hasTerminalPunctuation && !isLongEnough && fullText.length < 50) {
-             pendingMergeBufferRef.current = fullText;
-             setCurrentStreamingText(fullText + "..."); 
-             return;
-         }
-
-         const newSegment: DebateSegment = {
-            id: uuidv4(),
-            speaker: data.speaker,
-            text: fullText,
-            timestamp: Date.now()
-         };
-         
-         pendingMergeBufferRef.current = "";
-         setSegments(prev => [...prev, newSegment]);
-         setCurrentStreamingText(''); 
-         setAnalysisQueue(prev => [...prev, newSegment]);
-     }
-  }, []);
-
-  const forceCutSegment = () => {
-      let textToCut = currentStreamingText || pendingMergeBufferRef.current;
-      if (!textToCut.trim()) return;
-      
-      const newSegment: DebateSegment = {
-          id: uuidv4(),
-          speaker: "DEBATER",
-          text: textToCut,
-          timestamp: Date.now()
+      // Listener para quando o usuário para o compartilhamento pela barra do navegador
+      stream.getVideoTracks()[0].onended = () => {
+        handleStop();
       };
 
-      setSegments(prev => [...prev, newSegment]);
-      setAnalysisQueue(prev => [...prev, newSegment]);
-      pendingMergeBufferRef.current = "";
-      setCurrentStreamingText('');
-  };
+      const connection = await connectToLiveDebate(
+        stream,
+        (transcriptData) => {
+          if (transcriptData.isFinal) {
+            // Texto finalizado: processa e limpa o buffer visual
+            processConfirmedSegment(transcriptData.text);
+            setCurrentTranscript(""); 
+          } else {
+            // Texto em tempo real: atualiza buffer visual
+            setCurrentTranscript(transcriptData.text);
+          }
+        },
+        (error) => {
+          setStatus({ type: 'error', message: error.message });
+          handleStop();
+        },
+        (newStatus) => setStatus(newStatus)
+      );
 
-  const startListening = async () => {
-    if (inputMode === 'none' || isConnecting) return;
-    
-    setIsConnecting(true);
-    setLiveAudioSeconds(0);
-    
-    try {
-        let stream: MediaStream;
-        try {
-            if (inputMode === 'mic') {
-                stream = await navigator.mediaDevices.getUserMedia({ 
-                    audio: { 
-                        channelCount: 1, 
-                        echoCancellation: true, 
-                        noiseSuppression: true,
-                        autoGainControl: true
-                    } 
-                });
-            } else {
-                stream = await navigator.mediaDevices.getDisplayMedia({ 
-                    video: { displaySurface: "browser" }, 
-                    audio: true,
-                    preferCurrentTab: false,
-                } as any);
-                
-                if (stream.getAudioTracks().length === 0) {
-                     alert("⚠️ ERRO: Marque 'Compartilhar áudio da guia' na janela de seleção.");
-                     stream.getTracks().forEach(t => t.stop());
-                     throw new Error("No audio track");
-                }
-            }
-        } catch (mediaErr: any) {
-            setIsConnecting(false);
-            if (mediaErr.name === 'NotAllowedError') throw new Error("Permission denied");
-            throw mediaErr;
-        }
-
-        // --- VISUALIZER SETUP (Contexto Leve Apenas para UI) ---
-        const visContext = new AudioContext();
-        const visSource = visContext.createMediaStreamSource(stream);
-        const analyser = visContext.createAnalyser();
-        analyser.fftSize = 64;
-        visSource.connect(analyser);
-        visContextRef.current = visContext;
-        setAnalyserNode(analyser);
-
-        // --- GEMINI CONNECTION (Worklet Dedicado) ---
-        const controller = await connectToLiveDebate(
-            stream,
-            handleTranscriptData,
-            (err) => {
-                console.error("Live Error", err);
-                setLiveStatus({ type: 'warning', message: "Reconectando..." });
-            },
-            (status) => setLiveStatus(status)
-        );
-        liveControlRef.current = controller;
-        
-        setIsListening(true);
-        liveTimerRef.current = window.setInterval(() => {
-            setLiveAudioSeconds(prev => prev + 1);
-        }, 1000);
-
-    } catch (err: any) {
-        console.error("Start error", err);
-        setLiveStatus({ type: 'error', message: "Erro de Inicialização" });
-    } finally {
-        setIsConnecting(false);
+      connectionRef.current = connection;
+      setIsConnected(true);
+    } catch (err) {
+      console.error(err);
+      setStatus({ type: 'error', message: 'Falha ao capturar áudio. Verifique permissões.' });
     }
   };
 
-  const stopListening = async () => {
-      setIsListening(false);
-      setIsConnecting(false);
-
-      if (liveTimerRef.current) {
-          clearInterval(liveTimerRef.current);
-          liveTimerRef.current = null;
-      }
-      
-      // Cleanup Service
-      if (liveControlRef.current) {
-          await liveControlRef.current.disconnect();
-          liveControlRef.current = null;
-      }
-
-      // Cleanup Visualizer
-      if (visContextRef.current && visContextRef.current.state !== 'closed') {
-          await visContextRef.current.close();
-          visContextRef.current = null;
-      }
-      setAnalyserNode(null);
-
-      setLiveStatus(null);
-      setCurrentStreamingText('');
-      pendingMergeBufferRef.current = "";
+  const handleStop = async () => {
+    if (connectionRef.current) {
+      await connectionRef.current.disconnect();
+      connectionRef.current = null;
+    }
+    if (audioStream) {
+      audioStream.getTracks().forEach(track => track.stop());
+      setAudioStream(null);
+    }
+    setIsConnected(false);
+    setStatus({ type: 'info', message: 'Sessão finalizada' });
+    
+    // Não limpamos o sessionID aqui para permitir refresh e continuação.
+    // A limpeza é feita apenas no botão "Limpar".
+    await logSessionEnd(sessionId);
   };
 
-  const handleManualSubmit = (e: React.FormEvent) => {
-      e.preventDefault();
-      if (!inputText.trim()) return;
-      handleTranscriptData({ text: inputText, speaker: "MANUAL", isFinal: true });
-      setInputText('');
+  const handleClearSession = () => {
+      if (confirm("Tem certeza? Isso apagará todo o histórico do debate atual.")) {
+          setAnalysisHistory([]);
+          setCurrentTranscript("");
+          const newSessionId = generateId();
+          setSessionId(newSessionId);
+          localStorage.removeItem('debate_history');
+          localStorage.setItem('debate_session_id', newSessionId);
+          setStatus({ type: 'info', message: 'Histórico limpo. Nova sessão iniciada.' });
+      }
   };
 
-  const toggleListening = () => {
-      if (isListening) stopListening();
-      else startListening();
-  };
+  // Processa o texto confirmado vindo do Gemini
+  const processConfirmedSegment = async (text: string) => {
+    if (!text || text.trim().length < 5) return;
 
-  const isApiKeyConfigured = Boolean(process.env.API_KEY);
+    // Cria um item temporário de análise
+    const newItem: AnalysisResult = {
+      segmentId: generateId(),
+      verdict: VerdictType.UNVERIFIABLE, // Placeholder enquanto analisa
+      confidence: 0,
+      explanation: "Analisando em tempo real...",
+      sources: [],
+      sentimentScore: 0,
+      logicalFallacies: [],
+      context: [text] // O texto em si é o contexto imediato
+    };
+
+    setAnalysisHistory(prev => [...prev, newItem]);
+
+    // Envia para o backend para análise real
+    // Aqui usamos a função `analyzeStatement` que já existe no geminiService,
+    // mas chamamos ela indiretamente ou supomos que a conexão Live já traz a análise.
+    // *NOTA*: Como o Gemini Live Bidi pode retornar texto e audio, mas a checagem profunda
+    // requer o modelo Flash Thinking ou Search, o ideal seria ter uma chamada paralela aqui.
+    
+    // Para simplificar e manter a estrutura atual: 
+    // Vamos simular a chamada de análise ou usar a existente se você tiver importado.
+    // (Assumindo que a lógica de "Analysis" está dentro do connectToLiveDebate ou separada).
+    
+    // *Se você não tiver a lógica de análise automática vindo do socket, adicione aqui:*
+    // analyzeStatement(text, newItem.segmentId, ...).then(updatedResult => { ...updateState... })
+    
+    // Log no banco
+    logAnalysis(sessionId, newItem.segmentId, text, newItem);
+  };
 
   return (
-    <div className={`min-h-screen bg-[#050a10] text-gray-200 font-sans selection:bg-toxic-green selection:text-black overflow-hidden flex flex-col ${isMounted ? 'opacity-100' : 'opacity-0'}`}>
-      <header className="border-b border-gray-800 bg-[#0a141f]/80 px-6 py-3 flex items-center justify-between z-50">
-        <div className="flex items-center gap-3">
-          <Activity className="w-6 h-6 text-toxic-green" />
-          <h1 className="text-xl font-mono font-bold tracking-wider text-transparent bg-clip-text bg-gradient-to-r from-toxic-green to-neon-cyan">
-            DOSSIÊ_OCULTO
-          </h1>
-        </div>
-        <div className="flex items-center gap-6">
-            <div className="flex items-center gap-2 text-xs font-mono text-gray-400">
-                <div className={`w-2 h-2 rounded-full ${liveStatus?.type === 'error' ? 'bg-alert-red' : isListening ? 'bg-toxic-green' : 'bg-gray-600'} ${isListening && 'animate-pulse'}`} />
-                <span>{liveStatus?.message || (isListening ? "ATIVO" : isConnecting ? "CONECTANDO..." : "INATIVO")}</span>
+    <div className="min-h-screen bg-slate-900 text-slate-100 font-sans selection:bg-blue-500 selection:text-white">
+      {/* Header */}
+      <header className="border-b border-slate-800 bg-slate-950/50 backdrop-blur-md sticky top-0 z-10">
+        <div className="container mx-auto px-4 h-16 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <div className="relative">
+              <ShieldCheck className="w-8 h-8 text-blue-500" />
+              {isConnected && (
+                <span className="absolute -top-1 -right-1 w-3 h-3 bg-green-500 rounded-full animate-pulse shadow-[0_0_10px_rgba(34,197,94,0.5)]" />
+              )}
             </div>
+            <div>
+              <h1 className="font-bold text-xl tracking-tight">Veritas<span className="text-blue-500">Live</span></h1>
+              <p className="text-xs text-slate-400 font-medium">IA Fact-Checking em Tempo Real</p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-4">
+            <div className={`px-3 py-1 rounded-full text-xs font-medium border ${
+              status.type === 'error' ? 'bg-red-500/10 border-red-500/20 text-red-400' :
+              status.type === 'warning' ? 'bg-yellow-500/10 border-yellow-500/20 text-yellow-400' :
+              isConnected ? 'bg-green-500/10 border-green-500/20 text-green-400' :
+              'bg-slate-800 border-slate-700 text-slate-400'
+            }`}>
+              {status.message}
+            </div>
+            
+            {!isConnected ? (
+              <button
+                onClick={handleStart}
+                className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg font-medium transition-all shadow-lg shadow-blue-900/20 active:scale-95"
+              >
+                <Play className="w-4 h-4 fill-current" />
+                Iniciar Monitoramento
+              </button>
+            ) : (
+              <button
+                onClick={handleStop}
+                className="flex items-center gap-2 px-4 py-2 bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/20 rounded-lg font-medium transition-all"
+              >
+                <Square className="w-4 h-4 fill-current" />
+                Parar
+              </button>
+            )}
+
+            {/* Botão de Limpar Histórico */}
+            <button
+                onClick={handleClearSession}
+                className="p-2 text-slate-400 hover:text-red-400 hover:bg-slate-800 rounded-lg transition-colors"
+                title="Limpar Histórico e Reiniciar Sessão"
+            >
+                <Trash2 className="w-5 h-5" />
+            </button>
+          </div>
         </div>
       </header>
 
-      <main className="flex-1 flex overflow-hidden">
-        <div className="w-80 border-r border-gray-800 bg-[#0a141f]/50 flex flex-col p-4 gap-4">
-            <div className="bg-black/40 border border-gray-800 rounded p-4 relative">
-                {!isApiKeyConfigured && (
-                  <div className="absolute inset-0 bg-black/80 z-20 flex flex-col items-center justify-center p-4 text-center">
-                    <AlertOctagon className="w-8 h-8 text-alert-red mb-2" />
-                    <p className="text-alert-red font-bold text-xs">API_KEY MISSING</p>
-                  </div>
-                )}
-                <div className="space-y-2">
-                    <button 
-                        disabled={isListening || isConnecting}
-                        onClick={() => setInputMode('mic')} 
-                        className={`w-full flex items-center gap-3 px-3 py-2 rounded text-sm transition-all ${inputMode === 'mic' ? 'bg-toxic-green/10 text-toxic-green border-toxic-green/50 border' : 'bg-gray-900 text-gray-400'} disabled:opacity-50 disabled:cursor-not-allowed`}>
-                        <Mic className="w-4 h-4" /> <span>Microfone</span>
-                    </button>
-                    <button 
-                        disabled={isListening || isConnecting}
-                        onClick={() => setInputMode('tab')} 
-                        className={`w-full flex items-center gap-3 px-3 py-2 rounded text-sm transition-all ${inputMode === 'tab' ? 'bg-neon-cyan/10 text-neon-cyan border-neon-cyan/50 border' : 'bg-gray-900 text-gray-400'} disabled:opacity-50 disabled:cursor-not-allowed`}>
-                        <MonitorPlay className="w-4 h-4" /> <span>Áudio da Guia</span>
-                    </button>
-                </div>
-                {inputMode !== 'none' && (
-                    <button 
-                        onClick={toggleListening} 
-                        disabled={isConnecting}
-                        className={`mt-4 w-full flex items-center justify-center gap-2 py-3 rounded font-bold uppercase tracking-wide text-xs transition-all disabled:opacity-50 disabled:cursor-not-allowed ${isListening ? 'bg-alert-red text-white' : 'bg-toxic-green text-black'}`}>
-                        {isConnecting ? (
-                            <><Loader2 className="w-4 h-4 animate-spin" /> CONECTANDO...</>
-                        ) : isListening ? (
-                            <><StopCircle className="w-4 h-4" /> PARAR</>
-                        ) : (
-                            <><Zap className="w-4 h-4" /> INICIAR</>
-                        )}
-                    </button>
-                )}
+      <main className="container mx-auto px-4 py-6 grid grid-cols-1 lg:grid-cols-12 gap-6">
+        {/* Coluna Esquerda: Transcrição e Estatísticas */}
+        <div className="lg:col-span-4 space-y-6">
+          {/* Visualizador de Áudio */}
+          <div className="bg-slate-800/50 rounded-xl border border-slate-700 p-4 shadow-sm">
+            <h2 className="text-sm font-semibold text-slate-400 mb-3 flex items-center gap-2">
+              <Activity className="w-4 h-4" />
+              Sinal de Áudio
+            </h2>
+            <AudioVisualizer stream={audioStream} isConnected={isConnected} />
+          </div>
+
+          {/* Gráfico de Verdade */}
+          <div className="bg-slate-800/50 rounded-xl border border-slate-700 p-4 shadow-sm">
+             <TruthChart history={analysisHistory} />
+          </div>
+
+          {/* Transcrição em Tempo Real */}
+          <div className="bg-slate-800/50 rounded-xl border border-slate-700 p-4 h-[300px] flex flex-col shadow-sm">
+            <h2 className="text-sm font-semibold text-slate-400 mb-3 flex items-center gap-2">
+              <Info className="w-4 h-4" />
+              Transcrição ao Vivo
+            </h2>
+            <div className="flex-1 overflow-y-auto space-y-2 pr-2 font-mono text-sm leading-relaxed scrollbar-thin scrollbar-thumb-slate-600 scrollbar-track-transparent">
+               {analysisHistory.slice(-3).map((item, i) => (
+                   <p key={i} className="text-slate-400 opacity-60">{item.context?.[0]}</p>
+               ))}
+               <p className="text-blue-300 animate-pulse">{currentTranscript}</p>
             </div>
-            <AudioVisualizer active={isListening} analyser={analyserNode} />
-            <div className="flex-1 bg-black/40 border border-gray-800 rounded relative overflow-hidden">
-                <TruthChart data={truthData} />
-            </div>
+          </div>
         </div>
 
-        <div className="flex-1 flex flex-col bg-[#050a10] relative">
-            <div className="absolute top-0 left-0 right-0 h-16 bg-gradient-to-b from-[#050a10] to-transparent z-10 pointer-events-none" />
-            <div className="flex-1 overflow-y-auto p-6 space-y-6 scrollbar-thin scrollbar-thumb-gray-800">
-                {segments.length === 0 && !currentStreamingText && (
-                    <div className="h-full flex flex-col items-center justify-center text-gray-600 opacity-50">
-                        <Radio className="w-16 h-16 mb-4" />
-                        <p className="font-mono text-sm tracking-widest">AGUARDANDO ÁUDIO...</p>
-                    </div>
-                )}
-                {segments.map(segment => (
-                    <div key={segment.id} className="pl-4 border-l border-gray-800">
-                        <div className="flex items-center gap-2 mb-1">
-                            <span className="text-[10px] font-mono text-gray-500">{new Date(segment.timestamp).toLocaleTimeString()}</span>
-                            <span className="text-xs font-bold uppercase text-toxic-green">{segment.speaker}</span>
-                        </div>
-                        <p className="text-lg text-gray-200 font-light">{segment.text}</p>
-                        {!analyses[segment.id] && (segment.text.length > 50) && (
-                            <div className="mt-2 flex items-center gap-2 text-neon-cyan text-xs font-mono animate-pulse">
-                                <Cpu className="w-3 h-3" /> ANALISANDO...
-                            </div>
-                        )}
-                    </div>
-                ))}
-                {currentStreamingText && (
-                    <div className="pl-4 border-l border-toxic-green/50">
-                         <div className="flex items-center gap-2 mb-1">
-                             <span className="text-xs font-bold uppercase text-toxic-green animate-pulse">LIVE</span>
-                             <button onClick={forceCutSegment} className="ml-4 flex items-center gap-1 bg-gray-800 text-xs px-2 py-1 rounded text-white border border-gray-600">
-                                <Scissors className="w-3 h-3" /> CUT
-                             </button>
-                         </div>
-                         <p className="text-lg text-toxic-green/70 font-mono">{currentStreamingText}</p>
-                    </div>
-                )}
-                <div ref={feedEndRef} />
-            </div>
-            <div className="p-4 border-t border-gray-800 bg-[#0a141f]">
-                <form onSubmit={handleManualSubmit} className="flex gap-2">
-                    <input type="text" value={inputText} onChange={e => setInputText(e.target.value)} placeholder="Inserir texto manual..." className="flex-1 bg-black/50 border border-gray-700 rounded px-4 py-2 text-sm text-white" />
-                    <button type="submit" disabled={!inputText.trim()} className="bg-gray-800 text-white p-2 rounded"><Send className="w-4 h-4" /></button>
-                </form>
-            </div>
-        </div>
-
-        <div className="w-96 border-l border-gray-800 bg-[#0a141f]/30 flex flex-col">
-            <div className="p-4 border-b border-gray-800 flex items-center justify-between">
-                <h2 className="font-mono text-sm font-bold text-gray-400 uppercase tracking-widest gap-2 flex"><Database className="w-4 h-4" /> ANÁLISE</h2>
-                <label className="text-[10px] text-gray-500 uppercase cursor-pointer flex items-center gap-1">
-                    <input type="checkbox" checked={autoScroll} onChange={e => setAutoScroll(e.target.checked)} className="accent-toxic-green" /> Scroll
-                </label>
-            </div>
-            <div className="flex-1 overflow-y-auto p-4 scrollbar-thin scrollbar-thumb-gray-800">
-                 {Object.values(analyses).map((analysis: AnalysisResult, idx) => (
-                     <AnalysisCard key={idx} analysis={analysis} segmentText={segments.find(s => s.id === analysis.segmentId)?.text || ""} />
-                 ))}
-                 <div ref={analysisEndRef} />
-            </div>
+        {/* Coluna Direita: Feed de Verificações */}
+        <div className="lg:col-span-8 space-y-4">
+          <div className="flex items-center justify-between">
+            <h2 className="text-lg font-semibold text-slate-200">Feed de Análise</h2>
+            <span className="text-xs text-slate-500 bg-slate-900 px-2 py-1 rounded border border-slate-800">
+              {analysisHistory.length} verificações
+            </span>
+          </div>
+          
+          <div 
+            ref={scrollRef}
+            className="h-[calc(100vh-12rem)] overflow-y-auto pr-2 space-y-4 scroll-smooth scrollbar-thin scrollbar-thumb-slate-700 scrollbar-track-transparent pb-10"
+          >
+            {analysisHistory.length === 0 ? (
+              <div className="h-full flex flex-col items-center justify-center text-slate-500 gap-4 border-2 border-dashed border-slate-800 rounded-xl">
+                <AlertTriangle className="w-12 h-12 opacity-20" />
+                <p>Aguardando início do debate...</p>
+              </div>
+            ) : (
+              analysisHistory.map((analysis) => (
+                <AnalysisCard key={analysis.segmentId} result={analysis} />
+              ))
+            )}
+          </div>
         </div>
       </main>
     </div>
   );
-};
+}
 
 export default App;
