@@ -18,7 +18,8 @@ export interface LiveConnectionController {
 }
 
 // --- AUDIO WORKLET CODE (INLINE) ---
-// Mantido igual: Processamento seguro em Thread separada
+// Processamento seguro em Thread separada
+// Mantido sem ganho artificial (Pure PCM)
 const PCM_PROCESSOR_CODE = `
 class PCMProcessor extends AudioWorkletProcessor {
   constructor() {
@@ -33,14 +34,17 @@ class PCMProcessor extends AudioWorkletProcessor {
     if (!input || !input[0]) return true;
     
     const inputChannel = input[0];
-    const inputRate = sampleRate;
+    const inputRate = sampleRate; // Taxa nativa do contexto
     
+    // Downsample dinâmico baseado na taxa nativa
     const step = inputRate / this.targetRate;
     let sourceIndex = 0;
     
     while (sourceIndex < inputChannel.length) {
        const val = inputChannel[Math.floor(sourceIndex)];
+       // Clamp simples (-1 a 1) sem ganho extra
        const s = Math.max(-1, Math.min(1, val));
+       // Conversão Float32 -> Int16
        const pcm = s < 0 ? s * 0x8000 : s * 0x7FFF;
        
        if (this.bufferIndex >= this.buffer.length) {
@@ -167,8 +171,11 @@ export const connectToLiveDebate = async (
 
   const initAudioStack = async () => {
       try {
-          audioContext = new AudioContext({ sampleRate: 48000 });
+          // FIX: Remover sampleRate forçado. Deixar o navegador usar a taxa nativa do hardware.
+          audioContext = new AudioContext(); 
           if (audioContext.state === 'suspended') await audioContext.resume();
+
+          console.log(`🔊 AudioContext iniciado em ${audioContext.sampleRate}Hz`);
 
           const blob = new Blob([PCM_PROCESSOR_CODE], { type: "application/javascript" });
           const workletUrl = URL.createObjectURL(blob);
@@ -198,6 +205,23 @@ export const connectToLiveDebate = async (
   const sendAudioChunk = (pcmInt16: Int16Array) => {
       if (connectionState !== 'CONNECTED' || !activeSessionPromise) return;
 
+      // --- TELEMETRIA DE ÁUDIO ---
+      // Calcula RMS para verificar se há silêncio digital saindo do navegador
+      let sumSq = 0;
+      for (let i = 0; i < pcmInt16.length; i++) {
+        sumSq += pcmInt16[i] * pcmInt16[i];
+      }
+      // RMS aproximado (não normalizado para 0-1, mas na escala Int16 0-32768)
+      const rms = Math.sqrt(sumSq / pcmInt16.length);
+
+      if (rms === 0) {
+        console.warn("🔇 ALERTA: Buffer de áudio zerado (Silêncio Digital).");
+      } else if (Math.random() > 0.95) { 
+        // Log amostral para não spammar o console
+        console.debug(`🔊 Enviando audio... [RMS: ${Math.floor(rms)}]`);
+      }
+      // ---------------------------
+
       const base64Data = arrayBufferToBase64(pcmInt16.buffer);
 
       activeSessionPromise.then(async (session) => {
@@ -226,9 +250,7 @@ export const connectToLiveDebate = async (
           config: {
             responseModalities: [Modality.AUDIO], 
             
-            // --- CORREÇÃO DO ERRO 1007 ---
-            // O campo 'model' aqui dentro causa erro de schema no backend.
-            // Enviar objeto vazio {} ativa a transcrição usando o modelo padrão da sessão.
+            // Ativa transcrição (Necessário enviar objeto vazio)
             // @ts-ignore
             inputAudioTranscription: { }, 
             
@@ -246,10 +268,10 @@ export const connectToLiveDebate = async (
                onStatus?.({ type: 'info', message: "ONLINE" });
             },
             onmessage: (msg: LiveServerMessage) => {
-               // Captura transcrição do usuário (O que você fala)
+               // Captura transcrição do usuário
                const inputTranscript = msg.serverContent?.inputTranscription?.text;
                
-               // Captura resposta do modelo (se houver)
+               // Captura resposta do modelo (se houver, embora tenhamos pedido para não gerar)
                const modelText = msg.serverContent?.modelTurn?.parts?.[0]?.text;
                
                if (inputTranscript) handleText(inputTranscript);
@@ -259,7 +281,6 @@ export const connectToLiveDebate = async (
                console.log(`🔴 Socket Fechado (${e.code})`);
                connectionState = 'DISCONNECTED';
                
-               // 1000 = Fechamento Normal; 1007 = Erro de Protocolo (Não deve reconectar em loop se persistir)
                if (e.code === 1000) {
                    shouldMaintainConnection = false;
                    onStatus?.({ type: 'info', message: "Desconectado" });
