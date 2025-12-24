@@ -87,7 +87,6 @@ export const analyzeStatement = async (
     });
 
     const jsonText = response.text; 
-    
     if (!jsonText) return {
       segmentId,
       verdict: VerdictType.UNVERIFIABLE,
@@ -143,30 +142,33 @@ export const connectToLiveDebate = async (
 ): Promise<LiveConnectionController> => {
   const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY;
   if (!apiKey) {
-    const e = new Error("API Key missing");
-    onError(e);
+    onError(new Error("API Key missing"));
     return { disconnect: async () => {}, flush: () => {} };
   }
   
   const ai = new GoogleGenAI({ apiKey });
   
-  // Setup AudioContext
   const audioContext = new AudioContext(); 
   if (audioContext.state === 'suspended') await audioContext.resume();
 
   const source = audioContext.createMediaStreamSource(stream);
   const processor = audioContext.createScriptProcessor(4096, 1, 1);
   const gain = audioContext.createGain();
-  gain.gain.value = 0; 
+  gain.gain.value = 0; // Mute local output
   
   let currentBuffer = "";
   let isConnected = false;
   let activeSession: any = null;
+  
+  // Buffer para acumular áudio antes de enviar (Estabilidade de Rede)
+  let audioAccumulator: Float32Array = new Float32Array(0);
+  const CHUNK_THRESHOLD = 3; // Acumula 3 chunks (~250ms) antes de enviar
+  let chunkCounter = 0;
 
   const handleText = (raw: string) => {
       const text = cleanTranscriptText(raw);
       if (text.length > 0) {
-          console.log("📝 RECEBIDO:", text);
+          console.log("📝 TRANSCRITO:", text);
           currentBuffer += " " + text;
           onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: false });
           
@@ -179,33 +181,27 @@ export const connectToLiveDebate = async (
 
   try {
     const streamRate = audioContext.sampleRate;
-    console.log(`🎤 Configurando Áudio: Input=${streamRate}Hz -> Output=16000Hz`);
+    console.log(`🎤 Iniciando: Input=${streamRate}Hz`);
 
     activeSession = await ai.live.connect({
       model: LIVE_MODEL_NAME,
       config: {
-        // [FIX 1] Modality.AUDIO mantém a conexão aberta (como uma chamada telefônica)
-        // Isso evita o Code 1000 (fechamento normal) prematuro.
-        responseModalities: [Modality.AUDIO], 
-        
-        // [FIX 2] Objeto vazio: ativa inputTranscription sem causar erro 1007 (invalid field)
+        responseModalities: [Modality.AUDIO], // AUDIO mantém a sessão aberta
         // @ts-ignore
-        inputAudioTranscription: {}, 
-        
+        inputAudioTranscription: {}, // Ativa transcrição (sem params para evitar erro 1007)
         systemInstruction: {
-            parts: [{ text: "You are a transcriber. Your ONLY job is to listen to the Portuguese audio and generate the text transcript exactly as spoken. Do not translate. Do not answer questions. Just output the Portuguese text." }]
+            parts: [{ text: "You are a transcriber. Transcribe the Portuguese audio exactly. Do not translate. Do not answer." }]
         }
       },
       callbacks: {
         onopen: () => {
-           console.log("🟢 Conectado ao Gemini Live!");
+           console.log("🟢 Conectado!");
            isConnected = true;
            onStatus?.({ type: 'info', message: "ESCUTANDO..." });
+           // REMOVIDO: activeSession.send() - Isso causava o fechamento 1000
         },
         onmessage: (msg: LiveServerMessage) => {
-           // Verifica se a transcrição veio pelo canal de entrada (User Echo)
            const t1 = msg.serverContent?.inputTranscription?.text;
-           // Verifica se a transcrição veio como resposta do modelo (Model Turn)
            const t2 = msg.serverContent?.modelTurn?.parts?.[0]?.text;
            
            if (t1) handleText(t1);
@@ -218,7 +214,7 @@ export const connectToLiveDebate = async (
         },
         onclose: (e) => {
            console.log("🔴 Fechado:", e);
-           if(isConnected) onStatus?.({ type: 'warning', message: `DESCONECTADO` });
+           if(isConnected) onStatus?.({ type: 'warning', message: "DESCONECTADO" });
            isConnected = false;
         },
         onerror: (err) => {
@@ -235,22 +231,40 @@ export const connectToLiveDebate = async (
 
       const inputData = e.inputBuffer.getChannelData(0);
       
-      // Monitor de Volume (Debug)
-      let sum = 0;
-      for(let i=0; i<100; i++) sum += Math.abs(inputData[i]);
-      if(sum > 0.001 && Math.random() < 0.01) console.log("📊 Audio chegando no processador...");
+      // 1. Boost de Volume (5x)
+      const boosted = new Float32Array(inputData.length);
+      let vol = 0;
+      for (let i = 0; i < inputData.length; i++) {
+          boosted[i] = inputData[i] * 5.0;
+          vol += Math.abs(inputData[i]);
+      }
 
-      try {
-          const pcm16k = downsampleTo16k(inputData, streamRate);
-          const base64Data = arrayBufferToBase64(pcm16k.buffer as ArrayBuffer);
+      // 2. Acumulação para envio mais estável
+      const temp = new Float32Array(audioAccumulator.length + boosted.length);
+      temp.set(audioAccumulator);
+      temp.set(boosted, audioAccumulator.length);
+      audioAccumulator = temp;
+      chunkCounter++;
 
-          // [CRÍTICO] Envio direto e correto (sem sessionPromise)
-          await activeSession.sendRealtimeInput([{ 
-              mimeType: "audio/pcm;rate=16000",
-              data: base64Data
-          }]);
-      } catch (err) {
-          // Ignora erros momentâneos de rede
+      if (chunkCounter >= CHUNK_THRESHOLD) {
+          if(vol > 0.01) console.log("📡 Enviando Buffer..."); // Debug de envio real
+          
+          try {
+              // 3. Processamento e Envio
+              const pcm16k = downsampleTo16k(audioAccumulator, streamRate);
+              const base64Data = arrayBufferToBase64(pcm16k.buffer as ArrayBuffer);
+
+              await activeSession.sendRealtimeInput([{ 
+                  mimeType: "audio/pcm;rate=16000",
+                  data: base64Data
+              }]);
+          } catch (err) {
+              // console.error(err);
+          } finally {
+              // Limpa buffer
+              audioAccumulator = new Float32Array(0);
+              chunkCounter = 0;
+          }
       }
     };
 
