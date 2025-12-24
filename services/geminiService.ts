@@ -111,14 +111,14 @@ export const analyzeStatement = async (
       explanation: "Erro técnico.",
       sources: [],
       sentimentScore: 0,
-      logicalFallacies: [], // Adicionado para satisfazer a interface
-      context: [],        // Adicionado para satisfazer a interface
+      logicalFallacies: [],
+      context: [],
     };
   }
 };
 
 // -------------------------------------------
-// CONEXÃO LIVE (PERSISTENT TOOL STREAM)
+// CONEXÃO LIVE (OMNIVOROUS STREAM)
 // -------------------------------------------
 
 export interface LiveConnectionController {
@@ -138,7 +138,7 @@ export const connectToLiveDebate = async (
     return { disconnect: async () => {}, flush: () => {} };
   }
 
-  // Clona o stream para garantir acesso exclusivo ao processador
+  // Clona o stream para evitar conflitos
   const stream = originalStream.clone();
   
   let shouldMaintainConnection = true;
@@ -146,19 +146,16 @@ export const connectToLiveDebate = async (
   let audioContext: AudioContext | null = null;
   let source: MediaStreamAudioSourceNode | null = null;
   let processor: ScriptProcessorNode | null = null;
-  // CORREÇÃO: Declarar gain no escopo externo
   let gain: GainNode | null = null;
   let reconnectCount = 0;
   let currentBuffer = "";
 
   const ai = new GoogleGenAI({ apiKey });
 
-  // 1. TOOL DEFINITION
   const transcriptTool: FunctionDeclaration = {
       name: "submit_transcript",
-      description: "Submits the raw text transcription of the Portuguese speech detected.",
+      description: "Submits the raw text transcription.",
       parameters: {
-          // CORREÇÃO: Usar Type.OBJECT (Enum correto)
           type: Type.OBJECT,
           properties: {
               text: {
@@ -173,7 +170,7 @@ export const connectToLiveDebate = async (
   const handleText = (raw: string) => {
       const text = cleanTranscriptText(raw);
       if (text.length > 0) {
-          console.log("📝 TRANSCRITO:", text);
+          console.log("📝 RECEBIDO:", text); // Debug essencial
           currentBuffer += " " + text;
           onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: false });
           
@@ -187,7 +184,7 @@ export const connectToLiveDebate = async (
   const establishConnection = () => {
     if (!shouldMaintainConnection) return;
 
-    console.log(`📡 Estabelecendo conexão... (Tentativa ${reconnectCount + 1})`);
+    console.log(`📡 Conectando... (Tentativa ${reconnectCount + 1})`);
     onStatus?.({ type: 'info', message: reconnectCount > 0 ? "RECONECTANDO..." : "CONECTANDO..." });
 
     try {
@@ -199,13 +196,10 @@ export const connectToLiveDebate = async (
             responseModalities: [Modality.AUDIO],
             // @ts-ignore
             inputAudioTranscription: {}, 
-            speechConfig: {
-                voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
-            },
-            systemInstruction: {
-                parts: [{ text: "You are a specialized audio transcriber. Listen continuously. Whenever you hear speech in Portuguese, IMMEDIATELY call the `submit_transcript` function with the text. Do NOT speak. Do NOT reply with audio. Do NOT summarize." }]
-            },
             tools: [{ functionDeclarations: [transcriptTool] }],
+            systemInstruction: {
+                parts: [{ text: "You are a transcriber. Listen to the Portuguese audio. Output the text immediately using the `submit_transcript` tool OR by simply replying with the text. Do NOT speak audio." }]
+            },
           },
           callbacks: {
             onopen: () => {
@@ -214,16 +208,30 @@ export const connectToLiveDebate = async (
                reconnectCount = 0;
             },
             onmessage: (msg: LiveServerMessage) => {
+               // DEBUG: Ver o que está chegando (pode remover depois)
+               // console.log("RAW:", JSON.stringify(msg.serverContent).substring(0, 100));
+
+               // 1. Fonte: Input Transcription (Eco rápido do usuário)
+               // Essa é a fonte mais rápida e comum para transcrição em tempo real
+               const inputTrx = msg.serverContent?.inputTranscription?.text;
+               if (inputTrx) handleText(inputTrx);
+
+               // 2. Fonte: Resposta do Modelo (Texto direto)
                const parts = msg.serverContent?.modelTurn?.parts;
                if (parts) {
                    for (const part of parts) {
+                       // 2a. Via Texto Normal
+                       if (part.text) {
+                           handleText(part.text);
+                       }
+                       // 2b. Via Chamada de Função
                        if (part.functionCall) {
                            const fc = part.functionCall;
                            if (fc.name === 'submit_transcript') {
                                const args = fc.args as any;
                                if (args && args.text) handleText(args.text);
-
-                               // Confirma recebimento para manter o fluxo
+                               
+                               // Responde OK para a função (para destravar o modelo)
                                sessionPromise.then(async (session) => {
                                     await session.sendToolResponse({
                                         functionResponses: [{
@@ -239,34 +247,30 @@ export const connectToLiveDebate = async (
                }
             },
             onclose: (e) => {
-               console.log("⚠️ Conexão fechada:", e);
                if (shouldMaintainConnection) {
+                   console.log("⚠️ Conexão caiu, reconectando...");
                    reconnectCount++;
                    setTimeout(establishConnection, 100); 
-               } else {
-                   onStatus?.({ type: 'warning', message: "DESCONECTADO" });
                }
             },
-            onerror: (err) => console.error("🔴 Erro de Socket:", err)
+            onerror: (err) => console.error("🔴 Erro Socket:", err)
           }
         });
 
         activeSessionPromise = sessionPromise;
 
         sessionPromise.catch(err => {
-            console.error("Erro Promise:", err);
             if (shouldMaintainConnection) setTimeout(establishConnection, 1000); 
         });
 
     } catch (err) {
-        console.error("Erro Geral:", err);
         if (shouldMaintainConnection) setTimeout(establishConnection, 1000);
     }
   };
 
   establishConnection();
 
-  // 3. PROCESSAMENTO DE ÁUDIO
+  // AUDIO PIPELINE
   const initAudio = async () => {
       audioContext = new AudioContext();
       if (audioContext.state === 'suspended') await audioContext.resume();
@@ -274,7 +278,7 @@ export const connectToLiveDebate = async (
       const streamRate = audioContext.sampleRate;
       source = audioContext.createMediaStreamSource(stream);
       processor = audioContext.createScriptProcessor(4096, 1, 1);
-      gain = audioContext.createGain(); // Agora usa a variável do escopo externo
+      gain = audioContext.createGain();
       gain.gain.value = 0;
 
       processor.onaudioprocess = async (e) => {
@@ -284,10 +288,11 @@ export const connectToLiveDebate = async (
           
           if (Math.random() < 0.05) console.log("💓 Audio Pulse");
 
-          let vol = 0;
+          // Boost de Volume (5x) para garantir que o modelo ouça
           const boosted = new Float32Array(inputData.length);
+          let vol = 0;
           for (let i = 0; i < inputData.length; i++) {
-              boosted[i] = inputData[i] * 5.0; // Boost 5x
+              boosted[i] = inputData[i] * 5.0; 
               vol += Math.abs(inputData[i]);
           }
 
@@ -319,7 +324,7 @@ export const connectToLiveDebate = async (
            shouldMaintainConnection = false;
            if (source) source.disconnect();
            if (processor) processor.disconnect();
-           if (gain) gain.disconnect(); // Agora funciona pois gain está no escopo correto
+           if (gain) gain.disconnect();
            if (activeSessionPromise) {
                try {
                    const session = await activeSessionPromise;
