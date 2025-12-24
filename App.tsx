@@ -8,17 +8,13 @@ import {
   Database,
   MonitorPlay,
   StopCircle,
-  DollarSign,
-  Sliders,
   Zap,
   Scissors,
-  Layers,
   AlertOctagon,
   Loader2
 } from 'lucide-react';
 import { DebateSegment, AnalysisResult, VerdictType } from './types';
 import { analyzeStatement, connectToLiveDebate, LiveStatus, LiveConnectionController } from './services/geminiService';
-// Backend removido para estabilidade
 import { AnalysisCard } from './components/AnalysisCard';
 import { TruthChart } from './components/TruthChart';
 import { AudioVisualizer } from './components/AudioVisualizer';
@@ -26,7 +22,7 @@ import { v4 as uuidv4 } from 'uuid';
 
 const App: React.FC = () => {
   const [isListening, setIsListening] = useState(false);
-  const [isConnecting, setIsConnecting] = useState(false); // NOVO: Bloqueio de UI
+  const [isConnecting, setIsConnecting] = useState(false);
   const [inputMode, setInputMode] = useState<'mic' | 'tab' | 'none'>('none');
   const [inputText, setInputText] = useState('');
   
@@ -48,11 +44,13 @@ const App: React.FC = () => {
   const liveTimerRef = useRef<number | null>(null);
   const feedEndRef = useRef<HTMLDivElement>(null);
   const analysisEndRef = useRef<HTMLDivElement>(null);
+  
+  // Persistência do Serviço
   const liveControlRef = useRef<LiveConnectionController | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null);
-  const visualizerStreamRef = useRef<MediaStream | null>(null);
+  
+  // Visualização de Áudio (Separada do Stream de envio para performance)
   const [analyserNode, setAnalyserNode] = useState<AnalyserNode | null>(null);
+  const visContextRef = useRef<AudioContext | null>(null);
 
   useEffect(() => { setIsMounted(true); }, []);
 
@@ -64,12 +62,7 @@ const App: React.FC = () => {
     if (autoScroll) analysisEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [analyses, autoScroll]);
 
-  const calculateCost = () => {
-    const textCost = (totalInputTokens / 1_000_000 * 0.075) + (totalOutputTokens / 1_000_000 * 0.30);
-    const audioCost = liveAudioSeconds * 0.0001; 
-    return (textCost + audioCost).toFixed(5);
-  };
-
+  // --- PROCESSING LOOP ---
   useEffect(() => {
     const processQueue = async () => {
         if (isProcessing || analysisQueue.length === 0) return;
@@ -139,7 +132,6 @@ const App: React.FC = () => {
          const isLongEnough = fullText.length > 80;
 
          if (!hasTerminalPunctuation && !isLongEnough && fullText.length < 50) {
-             console.log("Buffering:", fullText);
              pendingMergeBufferRef.current = fullText;
              setCurrentStreamingText(fullText + "..."); 
              return;
@@ -172,24 +164,28 @@ const App: React.FC = () => {
 
       setSegments(prev => [...prev, newSegment]);
       setAnalysisQueue(prev => [...prev, newSegment]);
-
       pendingMergeBufferRef.current = "";
       setCurrentStreamingText('');
-      
-      if (liveControlRef.current) liveControlRef.current.flush();
   };
 
   const startListening = async () => {
-    if (inputMode === 'none' || isConnecting) return; // Bloqueio
+    if (inputMode === 'none' || isConnecting) return;
     
-    setIsConnecting(true); // Trava UI
+    setIsConnecting(true);
     setLiveAudioSeconds(0);
     
     try {
         let stream: MediaStream;
         try {
             if (inputMode === 'mic') {
-                stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                stream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: { 
+                        channelCount: 1, 
+                        echoCancellation: true, 
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    } 
+                });
             } else {
                 stream = await navigator.mediaDevices.getDisplayMedia({ 
                     video: { displaySurface: "browser" }, 
@@ -209,30 +205,27 @@ const App: React.FC = () => {
             throw mediaErr;
         }
 
-        const audioContext = new AudioContext();
-        const source = audioContext.createMediaStreamSource(stream);
-        const analyser = audioContext.createAnalyser();
-        analyser.fftSize = 64; 
-        source.connect(analyser);
-        
-        audioContextRef.current = audioContext;
-        analyserRef.current = analyser;
+        // --- VISUALIZER SETUP (Contexto Leve Apenas para UI) ---
+        const visContext = new AudioContext();
+        const visSource = visContext.createMediaStreamSource(stream);
+        const analyser = visContext.createAnalyser();
+        analyser.fftSize = 64;
+        visSource.connect(analyser);
+        visContextRef.current = visContext;
         setAnalyserNode(analyser);
-        visualizerStreamRef.current = stream;
 
+        // --- GEMINI CONNECTION (Worklet Dedicado) ---
         const controller = await connectToLiveDebate(
             stream,
             handleTranscriptData,
             (err) => {
                 console.error("Live Error", err);
-                // Status update handles feedback
-                setLiveStatus({ type: 'warning', message: "Instabilidade..." });
+                setLiveStatus({ type: 'warning', message: "Reconectando..." });
             },
             (status) => setLiveStatus(status)
         );
         liveControlRef.current = controller;
         
-        // Sucesso
         setIsListening(true);
         liveTimerRef.current = window.setInterval(() => {
             setLiveAudioSeconds(prev => prev + 1);
@@ -240,14 +233,13 @@ const App: React.FC = () => {
 
     } catch (err: any) {
         console.error("Start error", err);
-        setLiveStatus({ type: 'error', message: "Falha de Inicialização" });
+        setLiveStatus({ type: 'error', message: "Erro de Inicialização" });
     } finally {
-        setIsConnecting(false); // Destrava UI
+        setIsConnecting(false);
     }
   };
 
   const stopListening = async () => {
-      // Cleanup Seguro e Assíncrono
       setIsListening(false);
       setIsConnecting(false);
 
@@ -256,20 +248,19 @@ const App: React.FC = () => {
           liveTimerRef.current = null;
       }
       
+      // Cleanup Service
       if (liveControlRef.current) {
           await liveControlRef.current.disconnect();
           liveControlRef.current = null;
       }
-      if (visualizerStreamRef.current) {
-          visualizerStreamRef.current.getTracks().forEach(track => track.stop());
-          visualizerStreamRef.current = null;
+
+      // Cleanup Visualizer
+      if (visContextRef.current && visContextRef.current.state !== 'closed') {
+          await visContextRef.current.close();
+          visContextRef.current = null;
       }
-      if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
-          await audioContextRef.current.close();
-          audioContextRef.current = null;
-      }
-      
       setAnalyserNode(null);
+
       setLiveStatus(null);
       setCurrentStreamingText('');
       pendingMergeBufferRef.current = "";

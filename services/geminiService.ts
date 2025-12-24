@@ -4,72 +4,88 @@ import { AnalysisResult, VerdictType } from "../types";
 const MODEL_NAME = "gemini-2.0-flash-exp";
 const LIVE_MODEL_NAME = "gemini-2.0-flash-exp";
 
+// --- TIPOS E ESTADOS ---
+
 export type LiveStatus = {
   type: 'info' | 'warning' | 'error';
   message: string;
 };
 
-// --- UTILS DE ÁUDIO ---
+type ConnectionState = 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED' | 'RECONNECTING';
+
+export interface LiveConnectionController {
+    disconnect: () => Promise<void>;
+}
+
+// --- AUDIO WORKLET CODE (INLINE) ---
+// Este código roda em uma thread separada da UI (Audio Thread).
+// Ele converte 44.1/48kHz para 16kHz PCM Int16 e faz buffer.
+const PCM_PROCESSOR_CODE = `
+class PCMProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.buffer = new Int16Array(2048); // Buffer interno menor
+    this.bufferIndex = 0;
+    this.targetRate = 16000;
+  }
+
+  process(inputs, outputs, parameters) {
+    const input = inputs[0];
+    if (!input || !input[0]) return true;
+    
+    const inputChannel = input[0]; // Mono
+    const inputRate = sampleRate; // Global do WorkletScope
+    
+    // Razão de Downsample (ex: 48000 / 16000 = 3)
+    // Usamos decimação simples para performance (funciona bem para fala)
+    const step = inputRate / this.targetRate;
+    
+    let sourceIndex = 0;
+    
+    // Processamento por bloco (128 frames padrão do WebAudio)
+    // Precisamos acumular pois 128 frames a 48k não enchem um buffer útil de 16k
+    while (sourceIndex < inputChannel.length) {
+       const val = inputChannel[Math.floor(sourceIndex)];
+       
+       // Conversão Float32 -> Int16 PCM
+       const s = Math.max(-1, Math.min(1, val));
+       const pcm = s < 0 ? s * 0x8000 : s * 0x7FFF;
+       
+       // Envia quando encher o buffer interno (reduz spam de mensagens para main thread)
+       if (this.bufferIndex >= this.buffer.length) {
+           this.port.postMessage(this.buffer.slice(0, this.bufferIndex));
+           this.bufferIndex = 0;
+       }
+       
+       this.buffer[this.bufferIndex++] = pcm;
+       sourceIndex += step;
+    }
+
+    return true;
+  }
+}
+
+registerProcessor('pcm-processor', PCMProcessor);
+`;
+
+// --- UTILS ---
 
 const cleanTranscriptText = (text: string): string => {
   if (!text) return "";
   return text.replace(/\s+/g, ' ').trim();
 };
 
-/**
- * Converte Float32 (Navegador) para Int16 (PCM) E faz o Downsample para 16kHz.
- */
-function downsampleAndConvertToPCM(input: Float32Array, inputRate: number): ArrayBuffer {
-    const targetRate = 16000;
-    
-    // Se já for 16k, apenas converte
-    if (inputRate === targetRate) {
-        const buffer = new ArrayBuffer(input.length * 2);
-        const view = new DataView(buffer);
-        for (let i = 0; i < input.length; i++) {
-            const s = Math.max(-1, Math.min(1, input[i]));
-            const val = s < 0 ? s * 0x8000 : s * 0x7FFF;
-            view.setInt16(i * 2, val, true); // Little Endian
-        }
-        return buffer;
-    }
-
-    // Cálculo de Downsample simples
-    const ratio = inputRate / targetRate;
-    const newLength = Math.ceil(input.length / ratio);
-    const buffer = new ArrayBuffer(newLength * 2);
-    const view = new DataView(buffer);
-    
-    for (let i = 0; i < newLength; i++) {
-        const offset = Math.floor(i * ratio);
-        const valFloat = input[Math.min(offset, input.length - 1)];
-        
-        // Clamp e Conversão
-        const s = Math.max(-1, Math.min(1, valFloat));
-        const valInt = s < 0 ? s * 0x8000 : s * 0x7FFF;
-        
-        view.setInt16(i * 2, valInt, true); // Little Endian
-    }
-    return buffer;
-}
-
-/**
- * OTIMIZAÇÃO: Conversão iterativa robusta para Base64.
- */
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
     let binary = '';
     const bytes = new Uint8Array(buffer);
     const len = bytes.byteLength;
-    
     for (let i = 0; i < len; i++) {
         binary += String.fromCharCode(bytes[i]);
     }
     return window.btoa(binary);
 }
 
-// -------------------------------------------
-// FACT CHECKING (Mantido Igual)
-// -------------------------------------------
+// --- FACT CHECKING (Mantido) ---
 export const analyzeStatement = async (
   text: string,
   segmentId: string,
@@ -134,14 +150,7 @@ export const analyzeStatement = async (
   }
 };
 
-// -------------------------------------------
-// CONEXÃO LIVE (ROBUSTA)
-// -------------------------------------------
-
-export interface LiveConnectionController {
-    disconnect: () => Promise<void>;
-    flush: () => void;
-}
+// --- CORE LIVE CONNECTION ---
 
 export const connectToLiveDebate = async (
   originalStream: MediaStream,
@@ -152,30 +161,146 @@ export const connectToLiveDebate = async (
   const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY;
   if (!apiKey) {
     onError(new Error("API Key missing"));
-    return { disconnect: async () => {}, flush: () => {} };
+    return { disconnect: async () => {} };
   }
 
+  // Clona o stream para garantir ciclo de vida independente
   const stream = originalStream.clone();
-  
-  let shouldMaintainConnection = true;
-  let activeSessionPromise: Promise<any> | null = null;
-  
-  // 🛡️ GATEKEEPER: Flag atômica de conexão
-  let isConnected = false;
-
-  let audioContext: AudioContext | null = null;
-  let source: MediaStreamAudioSourceNode | null = null;
-  let processor: ScriptProcessorNode | null = null;
-  let gain: GainNode | null = null;
-  let reconnectCount = 0;
-  let currentBuffer = "";
-
   const ai = new GoogleGenAI({ apiKey });
 
+  // STATE MACHINE
+  let connectionState: ConnectionState = 'DISCONNECTED';
+  let shouldMaintainConnection = true;
+  
+  // Refs para cleanup
+  let activeSessionPromise: Promise<any> | null = null;
+  let audioContext: AudioContext | null = null;
+  let workletNode: AudioWorkletNode | null = null;
+  let sourceNode: MediaStreamAudioSourceNode | null = null;
+  let reconnectTimeout: any = null;
+
+  // --- 1. Audio Setup (Worklet) ---
+  const initAudioStack = async () => {
+      try {
+          audioContext = new AudioContext({ sampleRate: 48000 }); // Força sample rate alto se possível
+          if (audioContext.state === 'suspended') await audioContext.resume();
+
+          // Carrega o Worklet via Blob URL
+          const blob = new Blob([PCM_PROCESSOR_CODE], { type: "application/javascript" });
+          const workletUrl = URL.createObjectURL(blob);
+          await audioContext.audioWorklet.addModule(workletUrl);
+
+          sourceNode = audioContext.createMediaStreamSource(stream);
+          workletNode = new AudioWorkletNode(audioContext, 'pcm-processor');
+
+          // EVENTO DE DADOS (Chega da Thread de Áudio)
+          workletNode.port.onmessage = (event) => {
+              // Int16Array buffer
+              const pcmInt16 = event.data;
+              sendAudioChunk(pcmInt16);
+          };
+
+          sourceNode.connect(workletNode);
+          workletNode.connect(audioContext.destination); // Necessário para manter o clock ativo em alguns browsers
+          
+          console.log("🔊 Audio Worklet Initialized");
+
+      } catch (e) {
+          console.error("Falha ao iniciar Audio Engine", e);
+          onError(e as Error);
+      }
+  };
+
+  // --- 2. WebSocket Logic (State Guarded) ---
+  const sendAudioChunk = (pcmInt16: Int16Array) => {
+      // GUARD: Só envia se estiver estritamente CONECTADO
+      if (connectionState !== 'CONNECTED' || !activeSessionPromise) return;
+
+      const base64Data = arrayBufferToBase64(pcmInt16.buffer);
+
+      activeSessionPromise.then(async (session) => {
+          // Double Check pós-resolução da promise
+          if (connectionState !== 'CONNECTED') return;
+
+          try {
+              await session.sendRealtimeInput([{ 
+                  mimeType: "audio/pcm", // Protocolo lida com rate
+                  data: base64Data
+              }]);
+          } catch (e) {
+              // Silently catch send errors during transitions
+          }
+      });
+  };
+
+  const establishConnection = async () => {
+    if (!shouldMaintainConnection) return;
+
+    connectionState = 'CONNECTING';
+    onStatus?.({ type: 'info', message: "CONECTANDO..." });
+
+    try {
+        const sessionPromise = ai.live.connect({
+          model: LIVE_MODEL_NAME,
+          config: {
+            responseModalities: [Modality.AUDIO], // Necessário para estabilidade
+            inputAudioTranscription: { model: LIVE_MODEL_NAME }, // Habilita ASR
+            systemInstruction: {
+                parts: [{ text: "You are a passive transcription system. Your ONLY job is to transcribe the input audio to Portuguese. Do NOT generate audio responses." }]
+            },
+            speechConfig: {
+                voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
+            }
+          },
+          callbacks: {
+            onopen: () => {
+               console.log("🟢 Conectado (Worklet Mode)");
+               connectionState = 'CONNECTED';
+               onStatus?.({ type: 'info', message: "ONLINE" });
+            },
+            onmessage: (msg: LiveServerMessage) => {
+               const inputTranscript = msg.serverContent?.inputTranscription?.text;
+               const modelText = msg.serverContent?.modelTurn?.parts?.[0]?.text;
+               
+               if (inputTranscript) handleText(inputTranscript);
+               if (modelText) handleText(modelText);
+            },
+            onclose: (e) => {
+               console.log(`🔴 Socket Fechado (${e.code})`);
+               connectionState = 'DISCONNECTED';
+               
+               if (shouldMaintainConnection) {
+                   connectionState = 'RECONNECTING';
+                   onStatus?.({ type: 'warning', message: "RECONECTANDO..." });
+                   reconnectTimeout = setTimeout(establishConnection, 1000); 
+               }
+            },
+            onerror: (err) => {
+                console.error("Erro Socket:", err);
+                connectionState = 'DISCONNECTED';
+            }
+          }
+        });
+
+        activeSessionPromise = sessionPromise;
+        // Catch inicial da promise de conexão
+        sessionPromise.catch(() => {
+             if (shouldMaintainConnection && connectionState !== 'CONNECTED') {
+                 reconnectTimeout = setTimeout(establishConnection, 1000);
+             }
+        });
+
+    } catch (err) {
+        connectionState = 'DISCONNECTED';
+        if (shouldMaintainConnection) reconnectTimeout = setTimeout(establishConnection, 1000);
+    }
+  };
+
+  // Handlers de Texto
+  let currentBuffer = "";
   const handleText = (raw: string) => {
       const text = cleanTranscriptText(raw);
       if (text.length > 0) {
-          console.log("📝 TRANSCRITO:", text); 
           currentBuffer += " " + text;
           onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: false });
           
@@ -186,165 +311,36 @@ export const connectToLiveDebate = async (
       }
   };
 
-  const establishConnection = () => {
-    if (!shouldMaintainConnection) return;
+  // INICIALIZAÇÃO
+  await initAudioStack(); // Inicia audio engine primeiro
+  establishConnection();  // Inicia socket
 
-    onStatus?.({ type: 'info', message: "CONECTANDO..." });
-
-    try {
-        const sessionPromise = ai.live.connect({
-          model: LIVE_MODEL_NAME,
-          config: {
-            // FIX CRÍTICO: Modality.AUDIO impede erro 1007 e queda de conexão
-            responseModalities: [Modality.AUDIO], 
-            
-            // Ativa ASR
-            inputAudioTranscription: {
-                model: LIVE_MODEL_NAME 
-            },
-            
-            // System Prompt Passivo
-            systemInstruction: {
-                parts: [{ text: "You are a passive transcription system. Your ONLY job is to transcribe the input audio to Portuguese. Do NOT generate audio responses. Do NOT speak. Just listen and transcribe." }]
-            },
-            // Configuração de voz dummy (obrigatória para AUDIO modality, mesmo que não usada)
-            speechConfig: {
-                voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
-            }
-          },
-          callbacks: {
-            onopen: () => {
-               console.log("🟢 Conexão Estável (Audio Mode)");
-               isConnected = true; 
-               onStatus?.({ type: 'info', message: "ESCUTANDO" });
-               reconnectCount = 0;
-            },
-            onmessage: (msg: LiveServerMessage) => {
-               // Prioridade: Transcrição do Input (O que o usuário/áudio disse)
-               const inputTranscript = msg.serverContent?.inputTranscription?.text;
-               if (inputTranscript) {
-                   handleText(inputTranscript);
-               }
-
-               // Se o modelo alucinar e gerar texto, capturamos também, mas ignoramos áudio
-               const modelText = msg.serverContent?.modelTurn?.parts?.[0]?.text;
-               if (modelText) {
-                   handleText(modelText);
-               }
-            },
-            onclose: (e) => {
-               isConnected = false; // Bloqueio imediato
-               console.log(`🔴 Conexão Fechada (Code: ${e.code})`);
-               if (shouldMaintainConnection) {
-                   onStatus?.({ type: 'warning', message: "RECONECTANDO..." });
-                   setTimeout(establishConnection, 500); 
-               }
-            },
-            onerror: (err) => {
-                isConnected = false;
-                console.error("🔴 Erro Socket:", err);
-            }
-          }
-        });
-
-        activeSessionPromise = sessionPromise;
-
-        sessionPromise.catch(err => {
-            isConnected = false;
-            if (shouldMaintainConnection) {
-                setTimeout(establishConnection, 1000); 
-            }
-        });
-
-    } catch (err) {
-        isConnected = false;
-        if (shouldMaintainConnection) setTimeout(establishConnection, 1000);
-    }
-  };
-
-  establishConnection();
-
-  const initAudio = async () => {
-      audioContext = new AudioContext();
-      if (audioContext.state === 'suspended') await audioContext.resume();
-      
-      const streamRate = audioContext.sampleRate;
-      console.log(`🎤 Input Rate: ${streamRate}Hz`);
-
-      source = audioContext.createMediaStreamSource(stream);
-      processor = audioContext.createScriptProcessor(4096, 1, 1);
-      gain = audioContext.createGain();
-      gain.gain.value = 0; // Mute local feedback
-
-      processor.onaudioprocess = async (e) => {
-          // GATEKEEPER 1: Verificação rápida
-          if (!activeSessionPromise || !isConnected) return;
-
-          const inputData = e.inputBuffer.getChannelData(0);
-          
-          try {
-              // 1. Processamento de Áudio (Boost + Downsample)
-              const boosted = new Float32Array(inputData.length);
-              for (let i = 0; i < inputData.length; i++) boosted[i] = inputData[i] * 5.0; 
-
-              const pcmBuffer = downsampleAndConvertToPCM(boosted, streamRate);
-              const base64Data = arrayBufferToBase64(pcmBuffer);
-
-              // 2. Envio Seguro (Race Condition Proof)
-              activeSessionPromise.then(async (session) => {
-                 // GATEKEEPER 2: Verificação final pré-envio
-                 if (!isConnected) return;
-
-                 try {
-                     await session.sendRealtimeInput([{ 
-                          mimeType: "audio/pcm;rate=16000",
-                          data: base64Data
-                      }]);
-                 } catch (sendError: any) {
-                     // SILENT CATCH: Ignora erros de "Socket Closed" durante transições
-                     if (sendError.message?.includes("CLOSING") || sendError.message?.includes("CLOSED") || !isConnected) {
-                         isConnected = false; 
-                     } else {
-                         // Apenas loga se for erro real de payload
-                         console.warn("Drop de pacote de áudio (esperado em reconexão)");
-                     }
-                 }
-              }).catch(() => {
-                  // Catch da Promise do Session (raro, mas seguro)
-                  isConnected = false;
-              });
-
-          } catch (err) {
-              console.error("Erro crítico processador:", err);
-          }
-      };
-
-      source.connect(processor);
-      processor.connect(gain);
-      gain.connect(audioContext.destination);
-  };
-
-  initAudio();
-
+  // CONTROLLER PÚBLICO
   return {
        disconnect: async () => {
-           console.log("🛑 Finalizando Sessão...");
+           console.log("🛑 Encerrando Sessão...");
            shouldMaintainConnection = false;
-           isConnected = false; // Killswitch
+           connectionState = 'DISCONNECTED';
            
-           if (source) source.disconnect();
-           if (processor) processor.disconnect();
-           if (gain) gain.disconnect();
-           
+           if (reconnectTimeout) clearTimeout(reconnectTimeout);
+
+           // 1. Matar Worklet
+           if (workletNode) {
+               workletNode.port.onmessage = null;
+               workletNode.disconnect();
+           }
+           if (sourceNode) sourceNode.disconnect();
+           if (audioContext && audioContext.state !== 'closed') await audioContext.close();
+
+           // 2. Fechar Socket
            if (activeSessionPromise) {
                try {
                    const session = await activeSessionPromise;
-                   session.close();
+                   await session.close();
                } catch (e) { /* ignore */ }
            }
-           if (audioContext && audioContext.state !== 'closed') await audioContext.close();
+           
            stream.getTracks().forEach(t => t.stop()); 
-       },
-       flush: () => { currentBuffer = ""; }
+       }
     };
 }
