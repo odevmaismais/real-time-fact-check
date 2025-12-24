@@ -9,26 +9,58 @@ export type LiveStatus = {
   message: string;
 };
 
-// --- UTILS ---
+// --- UTILS DE ÁUDIO (MATEMÁTICA PURA) ---
+
 const cleanTranscriptText = (text: string): string => {
   if (!text) return "";
   return text.replace(/\s+/g, ' ').trim();
 };
 
-function floatTo16BitPCM(input: Float32Array): Int16Array {
-    const output = new Int16Array(input.length);
-    for (let i = 0; i < input.length; i++) {
-        const s = Math.max(-1, Math.min(1, input[i]));
-        output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+/**
+ * Converte Float32 (Navegador) para Int16 (PCM) E faz o Downsample para 16kHz.
+ * Isso é crucial para que o Gemini entenda a velocidade da fala.
+ */
+function downsampleAndConvertToPCM(input: Float32Array, inputRate: number): ArrayBuffer {
+    const targetRate = 16000;
+    
+    // Se já for 16k, apenas converte
+    if (inputRate === targetRate) {
+        const buffer = new ArrayBuffer(input.length * 2);
+        const view = new DataView(buffer);
+        for (let i = 0; i < input.length; i++) {
+            const s = Math.max(-1, Math.min(1, input[i]));
+            const val = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            view.setInt16(i * 2, val, true); // True = Little Endian
+        }
+        return buffer;
     }
-    return output;
+
+    // Cálculo de Downsample simples
+    const ratio = inputRate / targetRate;
+    const newLength = Math.ceil(input.length / ratio);
+    const buffer = new ArrayBuffer(newLength * 2);
+    const view = new DataView(buffer);
+    
+    for (let i = 0; i < newLength; i++) {
+        const offset = Math.floor(i * ratio);
+        // Garante que não estoure o array original
+        const valFloat = input[Math.min(offset, input.length - 1)];
+        
+        // Clamp e Conversão
+        const s = Math.max(-1, Math.min(1, valFloat));
+        const valInt = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        
+        view.setInt16(i * 2, valInt, true); // Little Endian
+    }
+    return buffer;
 }
 
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
     let binary = '';
     const bytes = new Uint8Array(buffer);
     const len = bytes.byteLength;
-    const chunkSize = 0x8000; 
+    const chunkSize = 0x8000; // 32k chunks para evitar stack overflow
+    
     for (let i = 0; i < len; i += chunkSize) {
         const chunk = bytes.subarray(i, Math.min(i + chunkSize, len));
         binary += String.fromCharCode.apply(null, Array.from(chunk));
@@ -37,7 +69,7 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
 }
 
 // -------------------------------------------
-// FACT CHECKING
+// FACT CHECKING (Mantido Igual)
 // -------------------------------------------
 export const analyzeStatement = async (
   text: string,
@@ -104,7 +136,7 @@ export const analyzeStatement = async (
 };
 
 // -------------------------------------------
-// CONEXÃO LIVE (SIMPLIFICADA)
+// CONEXÃO LIVE (16kHz FORCE)
 // -------------------------------------------
 
 export interface LiveConnectionController {
@@ -132,6 +164,7 @@ export const connectToLiveDebate = async (
   let source: MediaStreamAudioSourceNode | null = null;
   let processor: ScriptProcessorNode | null = null;
   let gain: GainNode | null = null;
+  let reconnectCount = 0;
   let currentBuffer = "";
 
   const ai = new GoogleGenAI({ apiKey });
@@ -139,7 +172,7 @@ export const connectToLiveDebate = async (
   const handleText = (raw: string) => {
       const text = cleanTranscriptText(raw);
       if (text.length > 0) {
-          console.log("📝 RECEBIDO:", text); 
+          console.log("📝 TRANSCRITO:", text); 
           currentBuffer += " " + text;
           onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: false });
           
@@ -153,7 +186,7 @@ export const connectToLiveDebate = async (
   const establishConnection = () => {
     if (!shouldMaintainConnection) return;
 
-    onStatus?.({ type: 'info', message: "ESCUTANDO..." });
+    onStatus?.({ type: 'info', message: "CONECTANDO..." });
 
     try {
         let sessionPromise: Promise<any>;
@@ -161,18 +194,18 @@ export const connectToLiveDebate = async (
         sessionPromise = ai.live.connect({
           model: LIVE_MODEL_NAME,
           config: {
-            // USANDO TEXTO AGORA. O modelo fecha a conexão ao terminar a frase.
-            // Nossa lógica de reconexão cuidará de abrir a próxima sessão.
             responseModalities: [Modality.TEXT], 
             // @ts-ignore
             inputAudioTranscription: {}, 
             systemInstruction: {
-                parts: [{ text: "Transcreva o áudio para Português. Apenas o texto, sem explicações." }]
+                parts: [{ text: "Transcreva o áudio para Português." }]
             },
           },
           callbacks: {
             onopen: () => {
-               console.log("🟢 Conectado!");
+               console.log("🟢 Conectado (16kHz Mode)!");
+               onStatus?.({ type: 'info', message: "ESCUTANDO" });
+               reconnectCount = 0;
             },
             onmessage: (msg: LiveServerMessage) => {
                const t1 = msg.serverContent?.inputTranscription?.text;
@@ -181,9 +214,9 @@ export const connectToLiveDebate = async (
                if (t2) handleText(t2);
             },
             onclose: (e) => {
-               // Reconexão imediata (Loop Infinito)
                if (shouldMaintainConnection) {
-                   setTimeout(establishConnection, 0); 
+                   console.log("🔄 Reconectando...");
+                   setTimeout(establishConnection, 100); 
                }
             },
             onerror: (err) => console.error("🔴 Erro Socket:", err)
@@ -208,9 +241,10 @@ export const connectToLiveDebate = async (
       if (audioContext.state === 'suspended') await audioContext.resume();
       
       const streamRate = audioContext.sampleRate;
-      console.log(`🎤 Taxa Nativa: ${streamRate}Hz`);
+      console.log(`🎤 Input Rate: ${streamRate}Hz -> Convertendo para 16000Hz`);
 
       source = audioContext.createMediaStreamSource(stream);
+      // Buffer de 4096 é seguro
       processor = audioContext.createScriptProcessor(4096, 1, 1);
       gain = audioContext.createGain();
       gain.gain.value = 0;
@@ -220,20 +254,20 @@ export const connectToLiveDebate = async (
 
           const inputData = e.inputBuffer.getChannelData(0);
           
-          if (Math.random() < 0.05) console.log("💓 Pulse");
+          if (Math.random() < 0.05) console.log("💓 Enviando Áudio 16k...");
 
-          // Boost de Volume
+          // 1. Volume Boost (5x)
           const boosted = new Float32Array(inputData.length);
           for (let i = 0; i < inputData.length; i++) boosted[i] = inputData[i] * 5.0; 
 
           try {
-              // Envia na taxa nativa para evitar corrupção
-              const pcmData = floatTo16BitPCM(boosted);
-              const base64Data = arrayBufferToBase64(pcmData.buffer as ArrayBuffer);
+              // 2. Downsample e Conversão PCM rigorosa
+              const pcmBuffer = downsampleAndConvertToPCM(boosted, streamRate);
+              const base64Data = arrayBufferToBase64(pcmBuffer);
 
               activeSessionPromise.then(async (session) => {
                  await session.sendRealtimeInput([{ 
-                      mimeType: `audio/pcm;rate=${streamRate}`,
+                      mimeType: "audio/pcm;rate=16000", // Agora é verdade!
                       data: base64Data
                   }]);
               }).catch(() => {});
@@ -249,6 +283,7 @@ export const connectToLiveDebate = async (
 
   return {
        disconnect: async () => {
+           console.log("🛑 Encerrando...");
            shouldMaintainConnection = false;
            if (source) source.disconnect();
            if (processor) processor.disconnect();
