@@ -1,4 +1,4 @@
-import { GoogleGenAI, LiveServerMessage, Modality, FunctionDeclaration, Type } from "@google/genai";
+import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
 import { AnalysisResult, VerdictType } from "../types";
 
 const MODEL_NAME = "gemini-2.0-flash-exp";
@@ -9,25 +9,10 @@ export type LiveStatus = {
   message: string;
 };
 
-// --- UTILS ---
-
 const cleanTranscriptText = (text: string): string => {
   if (!text) return "";
   return text.replace(/\s+/g, ' ').trim();
 };
-
-function downsampleTo16k(input: Float32Array, inputRate: number): Int16Array {
-    if (inputRate === 16000) return floatTo16BitPCM(input);
-    const ratio = inputRate / 16000;
-    const newLength = Math.ceil(input.length / ratio);
-    const output = new Int16Array(newLength);
-    for (let i = 0; i < newLength; i++) {
-        const offset = Math.floor(i * ratio);
-        const val = input[Math.min(offset, input.length - 1)];
-        output[i] = Math.max(-1, Math.min(1, val)) < 0 ? Math.max(-1, Math.min(1, val)) * 0x8000 : Math.max(-1, Math.min(1, val)) * 0x7FFF;
-    }
-    return output;
-}
 
 function floatTo16BitPCM(input: Float32Array): Int16Array {
     const output = new Int16Array(input.length);
@@ -93,8 +78,8 @@ export const analyzeStatement = async (
       explanation: data.explanation || "Sem análise",
       counterEvidence: data.counterEvidence,
       sources: sources,
-      sentimentScore: 0,
-      logicalFallacies: [],
+      sentimentScore: data.sentimentScore || 0,
+      logicalFallacies: data.logicalFallacies || [],
       context: contextHistory,
       tokenUsage: {
           promptTokens: response.usageMetadata?.promptTokenCount || 0,
@@ -118,7 +103,7 @@ export const analyzeStatement = async (
 };
 
 // -------------------------------------------
-// CONEXÃO LIVE (OMNIVOROUS STREAM)
+// CONEXÃO LIVE (NATIVE STREAM SIMPLIFICADO)
 // -------------------------------------------
 
 export interface LiveConnectionController {
@@ -138,7 +123,6 @@ export const connectToLiveDebate = async (
     return { disconnect: async () => {}, flush: () => {} };
   }
 
-  // Clona o stream para evitar conflitos
   const stream = originalStream.clone();
   
   let shouldMaintainConnection = true;
@@ -152,25 +136,10 @@ export const connectToLiveDebate = async (
 
   const ai = new GoogleGenAI({ apiKey });
 
-  const transcriptTool: FunctionDeclaration = {
-      name: "submit_transcript",
-      description: "Submits the raw text transcription.",
-      parameters: {
-          type: Type.OBJECT,
-          properties: {
-              text: {
-                  type: Type.STRING,
-                  description: "The transcribed text."
-              }
-          },
-          required: ["text"]
-      }
-  };
-
   const handleText = (raw: string) => {
       const text = cleanTranscriptText(raw);
       if (text.length > 0) {
-          console.log("📝 RECEBIDO:", text); // Debug essencial
+          console.log("📝 RECEBIDO:", text); 
           currentBuffer += " " + text;
           onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: false });
           
@@ -193,12 +162,13 @@ export const connectToLiveDebate = async (
         sessionPromise = ai.live.connect({
           model: LIVE_MODEL_NAME,
           config: {
-            responseModalities: [Modality.AUDIO],
+            // [MUDANÇA] Voltamos para TEXT. Se o modelo fechar a conexão (Code 1000), 
+            // a lógica de auto-reconnect lida com isso. É mais seguro que áudio mudo.
+            responseModalities: [Modality.TEXT], 
             // @ts-ignore
             inputAudioTranscription: {}, 
-            tools: [{ functionDeclarations: [transcriptTool] }],
             systemInstruction: {
-                parts: [{ text: "You are a transcriber. Listen to the Portuguese audio. Output the text immediately using the `submit_transcript` tool OR by simply replying with the text. Do NOT speak audio." }]
+                parts: [{ text: "You are a transcriber. Listen to the Portuguese audio and return the text transcription exactly. Do not add explanations." }]
             },
           },
           callbacks: {
@@ -208,47 +178,16 @@ export const connectToLiveDebate = async (
                reconnectCount = 0;
             },
             onmessage: (msg: LiveServerMessage) => {
-               // DEBUG: Ver o que está chegando (pode remover depois)
-               // console.log("RAW:", JSON.stringify(msg.serverContent).substring(0, 100));
-
-               // 1. Fonte: Input Transcription (Eco rápido do usuário)
-               // Essa é a fonte mais rápida e comum para transcrição em tempo real
-               const inputTrx = msg.serverContent?.inputTranscription?.text;
-               if (inputTrx) handleText(inputTrx);
-
-               // 2. Fonte: Resposta do Modelo (Texto direto)
-               const parts = msg.serverContent?.modelTurn?.parts;
-               if (parts) {
-                   for (const part of parts) {
-                       // 2a. Via Texto Normal
-                       if (part.text) {
-                           handleText(part.text);
-                       }
-                       // 2b. Via Chamada de Função
-                       if (part.functionCall) {
-                           const fc = part.functionCall;
-                           if (fc.name === 'submit_transcript') {
-                               const args = fc.args as any;
-                               if (args && args.text) handleText(args.text);
-                               
-                               // Responde OK para a função (para destravar o modelo)
-                               sessionPromise.then(async (session) => {
-                                    await session.sendToolResponse({
-                                        functionResponses: [{
-                                            id: fc.id,
-                                            name: fc.name,
-                                            response: { result: "ok" }
-                                        }]
-                                    });
-                               }).catch(() => {});
-                           }
-                       }
-                   }
-               }
+               // Verifica todas as fontes possíveis de texto
+               const t1 = msg.serverContent?.inputTranscription?.text;
+               const t2 = msg.serverContent?.modelTurn?.parts?.[0]?.text;
+               
+               if (t1) handleText(t1);
+               if (t2) handleText(t2);
             },
             onclose: (e) => {
+               console.log("⚠️ Conexão caiu:", e);
                if (shouldMaintainConnection) {
-                   console.log("⚠️ Conexão caiu, reconectando...");
                    reconnectCount++;
                    setTimeout(establishConnection, 100); 
                }
@@ -270,14 +209,16 @@ export const connectToLiveDebate = async (
 
   establishConnection();
 
-  // AUDIO PIPELINE
   const initAudio = async () => {
       audioContext = new AudioContext();
       if (audioContext.state === 'suspended') await audioContext.resume();
       
       const streamRate = audioContext.sampleRate;
+      console.log(`🎤 Taxa de Áudio Nativa: ${streamRate}Hz`); // Debug
+
       source = audioContext.createMediaStreamSource(stream);
-      processor = audioContext.createScriptProcessor(4096, 1, 1);
+      // Buffer maior (16384) para menos carga na CPU
+      processor = audioContext.createScriptProcessor(16384, 1, 1);
       gain = audioContext.createGain();
       gain.gain.value = 0;
 
@@ -288,7 +229,7 @@ export const connectToLiveDebate = async (
           
           if (Math.random() < 0.05) console.log("💓 Audio Pulse");
 
-          // Boost de Volume (5x) para garantir que o modelo ouça
+          // Boost de Volume (5x)
           const boosted = new Float32Array(inputData.length);
           let vol = 0;
           for (let i = 0; i < inputData.length; i++) {
@@ -299,12 +240,14 @@ export const connectToLiveDebate = async (
           if (vol < 0.0001) return;
 
           try {
-              const pcm16k = downsampleTo16k(boosted, streamRate);
-              const base64Data = arrayBufferToBase64(pcm16k.buffer as ArrayBuffer);
+              // [CRÍTICO] Envia na taxa NATIVA (sem downsample manual arriscado)
+              // O Gemini 2.0 suporta 48k se o cabeçalho estiver certo
+              const pcmData = floatTo16BitPCM(boosted);
+              const base64Data = arrayBufferToBase64(pcmData.buffer as ArrayBuffer);
 
               activeSessionPromise.then(async (session) => {
                  await session.sendRealtimeInput([{ 
-                      mimeType: "audio/pcm;rate=16000",
+                      mimeType: `audio/pcm;rate=${streamRate}`, // Usa a taxa real (ex: 48000)
                       data: base64Data
                   }]);
               }).catch(() => {});

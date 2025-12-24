@@ -15,9 +15,9 @@ import {
   Layers,
   AlertOctagon
 } from 'lucide-react';
-import { DebateSegment, AnalysisResult, VerdictType } from './types'; // Speech types removidos se não usados explicitamente ou importados via types
+import { DebateSegment, AnalysisResult, VerdictType } from './types';
 import { analyzeStatement, connectToLiveDebate, LiveStatus, LiveConnectionController } from './services/geminiService';
-import { loggingService } from './services/loggingService';
+// import { loggingService } from './services/loggingService'; // BACKEND DESATIVADO
 import { AnalysisCard } from './components/AnalysisCard';
 import { TruthChart } from './components/TruthChart';
 import { AudioVisualizer } from './components/AudioVisualizer';
@@ -51,7 +51,8 @@ const App: React.FC = () => {
   const analyserRef = useRef<AnalyserNode | null>(null);
   const visualizerStreamRef = useRef<MediaStream | null>(null);
   const [analyserNode, setAnalyserNode] = useState<AnalyserNode | null>(null);
-  const sessionIdRef = useRef<string | null>(null);
+  
+  // const sessionIdRef = useRef<string | null>(null); // BACKEND DESATIVADO
 
   useEffect(() => { setIsMounted(true); }, []);
 
@@ -69,6 +70,7 @@ const App: React.FC = () => {
     return (textCost + audioCost).toFixed(5);
   };
 
+  // --- PROCESS QUEUE ---
   useEffect(() => {
     const processQueue = async () => {
         if (isProcessing || analysisQueue.length === 0) return;
@@ -94,15 +96,15 @@ const App: React.FC = () => {
                 
                 if (analysis.tokenUsage) {
                     setTotalInputTokens(prev => prev + analysis.tokenUsage!.promptTokens);
-                    // CORREÇÃO: Usar responseTokens em vez de candidatesTokens
                     setTotalOutputTokens(prev => prev + analysis.tokenUsage!.responseTokens);
                 }
 
                 setAnalyses(prev => ({ ...prev, [segment.id]: analysis }));
                 
-                if (sessionIdRef.current) {
-                    loggingService.logAnalysis(sessionIdRef.current, segment, analysis);
-                }
+                // BACKEND REMOVIDO:
+                // if (sessionIdRef.current) {
+                //     loggingService.logAnalysis(sessionIdRef.current, segment, analysis);
+                // }
                 
                 let score = 0;
                 if (analysis.verdict === VerdictType.TRUE) score = 1;
@@ -187,8 +189,10 @@ const App: React.FC = () => {
 
   const startListening = async () => {
     if (inputMode === 'none') return;
-    const sid = await loggingService.startSession(inputMode);
-    if (sid) sessionIdRef.current = sid;
+    
+    // BACKEND DESATIVADO:
+    // const sid = await loggingService.startSession(inputMode);
+    // if (sid) sessionIdRef.current = sid;
 
     setIsListening(true);
     setLiveAudioSeconds(0);
@@ -253,10 +257,11 @@ const App: React.FC = () => {
 
   const stopListening = async () => {
       setIsListening(false);
-      if (sessionIdRef.current) {
-          await loggingService.endSession(sessionIdRef.current, calculateCost(), liveAudioSeconds);
-          sessionIdRef.current = null;
-      }
+      // BACKEND DESATIVADO
+      // if (sessionIdRef.current) {
+      //     await loggingService.endSession(sessionIdRef.current, calculateCost(), liveAudioSeconds);
+      //     sessionIdRef.current = null;
+      // }
       if (liveTimerRef.current) clearInterval(liveTimerRef.current);
       if (liveControlRef.current) {
           await liveControlRef.current.disconnect();
