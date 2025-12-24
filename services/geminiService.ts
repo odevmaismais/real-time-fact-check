@@ -246,20 +246,19 @@ export const connectToLiveDebate = async (
         const sessionPromise = ai.live.connect({
           model: LIVE_MODEL_NAME,
           config: {
-            // FIX CRÍTICO 1: Mudar para TEXT para evitar espera de VAD (silêncio)
+            // Configuração para Transcrição em Tempo Real (Texto Puro)
             responseModalities: [Modality.TEXT], 
             
-            // FIX CRÍTICO 2: inputAudioTranscription deve existir
+            // FIX CRÍTICO (Erro 1007): Objeto vazio para ativar transcrição.
+            // Não enviar 'model' aqui dentro.
             // @ts-ignore
-            inputAudioTranscription: { model: LIVE_MODEL_NAME }, 
+            inputAudioTranscription: { }, 
             
-            // FIX CRÍTICO 3: Instrução explícita para transcrição em tempo real
             systemInstruction: {
                 parts: [{ text: "You are a real-time transcriber. Transcribe the audio stream to Portuguese immediately as the words are spoken. Do not wait for complete sentences." }]
             },
             
-            // FIX CRÍTICO 4: speechConfig REMOVIDO COMPLETAMENTE
-            // A presença de speechConfig com Modality.TEXT causa Erro 1007.
+            // speechConfig REMOVIDO para evitar incompatibilidade com Modality.TEXT
           },
           callbacks: {
             onopen: () => {
@@ -268,8 +267,6 @@ export const connectToLiveDebate = async (
                onStatus?.({ type: 'info', message: "ONLINE" });
             },
             onmessage: (msg: LiveServerMessage) => {
-               // A transcrição pode vir como 'inputTranscription' (reconhecimento)
-               // ou como 'modelTurn' (se o modelo decidir "responder" com o texto)
                const inputTranscript = msg.serverContent?.inputTranscription?.text;
                const modelText = msg.serverContent?.modelTurn?.parts?.[0]?.text;
                
