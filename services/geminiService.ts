@@ -2,7 +2,7 @@ import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
 import { AnalysisResult, VerdictType } from "../types";
 
 const MODEL_NAME = "gemini-2.0-flash-exp";
-// CORREÇÃO: Prefixo obrigatório para a API Live
+// Prefixo 'models/' é necessário para a estabilidade da conexão em algumas regiões
 const LIVE_MODEL_NAME = "models/gemini-2.0-flash-exp";
 
 // --- TIPOS E ESTADOS ---
@@ -19,9 +19,9 @@ export interface LiveConnectionController {
 }
 
 // --- AUDIO WORKLET CODE (INLINE) ---
-// CORREÇÃO DE ÁUDIO: 
-// Removemos o Boost (tanh) pois o seu sinal de entrada já é alto (vídeo).
-// Usamos apenas um 'Box Filter' (média) para converter 48k -> 16k sem distorção.
+// PROCESSADOR PURO (FLAT RESPONSE)
+// Removemos qualquer ganho (boost). O sinal de vídeo já é alto o suficiente.
+// Usamos apenas um filtro de média para converter 48kHz -> 16kHz sem distorção.
 const PCM_PROCESSOR_CODE = `
 class PCMProcessor extends AudioWorkletProcessor {
   constructor() {
@@ -45,7 +45,7 @@ class PCMProcessor extends AudioWorkletProcessor {
         let sum = 0;
         let count = 0;
         
-        // Box Filter: Calcula a média das amostras para evitar aliasing no downsample
+        // Downsampling por Média (Evita ruído de aliasing)
         const start = Math.floor(inputIndex);
         const end = Math.min(inputChannel.length, Math.floor(inputIndex + ratio));
         
@@ -54,6 +54,7 @@ class PCMProcessor extends AudioWorkletProcessor {
             count++;
         }
         
+        // Proteção para bordas
         if (count === 0 && start < inputChannel.length) {
             sum = inputChannel[start];
             count = 1;
@@ -61,11 +62,11 @@ class PCMProcessor extends AudioWorkletProcessor {
 
         const avg = count > 0 ? sum / count : 0;
         
-        // SEM BOOST: Mantemos o volume original.
-        // Apenas clampamos para garantir que está no range válido (-1 a 1)
+        // SEM BOOST: O sinal passa original.
+        // Apenas garantimos que não exceda os limites (-1 a 1)
         const s = Math.max(-1, Math.min(1, avg));
         
-        // Conversão Float32 -> Int16 PCM
+        // Conversão para PCM 16-bit
         const pcm = s < 0 ? s * 0x8000 : s * 0x7FFF;
         
         if (this.bufferIndex >= this.buffer.length) {
@@ -99,7 +100,7 @@ function arrayBufferToBase64(buffer: ArrayBuffer | SharedArrayBuffer): string {
     return window.btoa(binary);
 }
 
-// --- FACT CHECKING (COM CORREÇÃO JSON) ---
+// --- FACT CHECKING (COM SANITIZAÇÃO JSON) ---
 export const analyzeStatement = async (
   text: string,
   segmentId: string,
@@ -127,7 +128,7 @@ export const analyzeStatement = async (
       },
     });
 
-    // Limpeza de Markdown antes do parse (evita SyntaxError)
+    // Sanitização: Remove blocos Markdown se o modelo os enviar
     let jsonText = response.text || "{}";
     jsonText = jsonText.replace(/```json/g, "").replace(/```/g, "").trim();
 
@@ -198,7 +199,7 @@ export const connectToLiveDebate = async (
           audioContext = new AudioContext(); 
           if (audioContext.state === 'suspended') await audioContext.resume();
 
-          console.log(`🔊 AudioContext: ${audioContext.sampleRate}Hz (Filtro Puro)`);
+          console.log(`🔊 AudioContext: ${audioContext.sampleRate}Hz (PURE PCM - NO BOOST)`);
 
           const blob = new Blob([PCM_PROCESSOR_CODE], { type: "application/javascript" });
           const workletUrl = URL.createObjectURL(blob);
@@ -258,7 +259,6 @@ export const connectToLiveDebate = async (
             // @ts-ignore
             inputAudioTranscription: { }, 
             systemInstruction: {
-                // Instrução para garantir texto fluido e contínuo
                 parts: [{ text: "You are a precise real-time transcriber. Transcribe the Portuguese audio stream exactly as spoken. Do not wait for punctuation. Output words immediately." }]
             },
           },
@@ -311,20 +311,16 @@ export const connectToLiveDebate = async (
     }
   };
 
-  // --- LÓGICA DE TEXTO (Sem picotar) ---
   let currentBuffer = "";
-  
   const handleText = (raw: string) => {
-      // Recebe o texto BRUTO. 
-      // O Gemini envia " pa" (com espaço) para colar na anterior.
+      // Recebe o texto BRUTO para preservar espaços e colar palavras corretamente.
       if (raw) {
-          // console.log("📝", `"${raw}"`); 
           currentBuffer += raw; 
           
           // Envia para UI com trim VISUAL apenas
           onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: false });
           
-          // Limpa buffer em frases completas para não estourar memória
+          // Limpa buffer em pontuação ou limite seguro
           if (currentBuffer.length > 200 || raw.match(/[.!?]$/)) {
               onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: true });
               currentBuffer = "";
