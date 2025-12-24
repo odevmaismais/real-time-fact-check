@@ -2,7 +2,8 @@ import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
 import { AnalysisResult, VerdictType } from "../types";
 
 const MODEL_NAME = "gemini-2.0-flash-exp";
-const LIVE_MODEL_NAME = "gemini-2.0-flash-exp";
+// CORREÇÃO: Prefixo 'models/' explícito conforme solicitado pelo log de rede esperado
+const LIVE_MODEL_NAME = "models/gemini-2.0-flash-exp";
 
 // --- TIPOS E ESTADOS ---
 
@@ -19,7 +20,7 @@ export interface LiveConnectionController {
 
 // --- AUDIO WORKLET CODE (INLINE) ---
 // Processamento seguro em Thread separada
-// Mantido sem ganho artificial (Pure PCM)
+// Mantido: Gain Boost (x3.5) para garantir que áudio de abas seja detectado
 const PCM_PROCESSOR_CODE = `
 class PCMProcessor extends AudioWorkletProcessor {
   constructor() {
@@ -34,17 +35,17 @@ class PCMProcessor extends AudioWorkletProcessor {
     if (!input || !input[0]) return true;
     
     const inputChannel = input[0];
-    const inputRate = sampleRate; // Taxa nativa do contexto
-    
-    // Downsample dinâmico baseado na taxa nativa
+    const inputRate = sampleRate;
     const step = inputRate / this.targetRate;
     let sourceIndex = 0;
     
     while (sourceIndex < inputChannel.length) {
        const val = inputChannel[Math.floor(sourceIndex)];
-       // Clamp simples (-1 a 1) sem ganho extra
-       const s = Math.max(-1, Math.min(1, val));
-       // Conversão Float32 -> Int16
+       
+       // BOOST: Multiplica o volume por 3.5x para evitar que o VAD ignore o áudio
+       const boosted = val * 3.5;
+       const s = Math.max(-1, Math.min(1, boosted));
+       
        const pcm = s < 0 ? s * 0x8000 : s * 0x7FFF;
        
        if (this.bufferIndex >= this.buffer.length) {
@@ -171,7 +172,6 @@ export const connectToLiveDebate = async (
 
   const initAudioStack = async () => {
       try {
-          // Usa sample rate nativo para evitar artefatos
           audioContext = new AudioContext(); 
           if (audioContext.state === 'suspended') await audioContext.resume();
 
@@ -205,7 +205,7 @@ export const connectToLiveDebate = async (
   const sendAudioChunk = (pcmInt16: Int16Array) => {
       if (connectionState !== 'CONNECTED' || !activeSessionPromise) return;
 
-      // --- TELEMETRIA DE ÁUDIO ---
+      // Telemetria
       let sumSq = 0;
       for (let i = 0; i < pcmInt16.length; i++) {
         sumSq += pcmInt16[i] * pcmInt16[i];
@@ -213,25 +213,27 @@ export const connectToLiveDebate = async (
       const rms = Math.sqrt(sumSq / pcmInt16.length);
 
       if (rms === 0) {
-        console.warn("🔇 ALERTA: Buffer de áudio zerado (Silêncio Digital).");
-      } else if (Math.random() > 0.95) { 
-        // Debug visual para confirmar fluxo
-        console.debug(`🔊 Enviando audio... [Size: ${pcmInt16.length}] [RMS: ${Math.floor(rms)}]`);
+        // Silence
+      } else if (Math.random() > 0.98) { 
+        console.debug(`🔊 Tx Chunk | RMS: ${Math.floor(rms)}`);
       }
-      // ---------------------------
 
       const base64Data = arrayBufferToBase64(pcmInt16.buffer);
 
       activeSessionPromise.then(async (session) => {
           if (connectionState !== 'CONNECTED') return;
           try {
-              await session.sendRealtimeInput([{ 
-                  mimeType: "audio/pcm;rate=16000", 
-                  data: base64Data
-              }]);
+              // CORREÇÃO CRÍTICA: Formato do objeto para sendRealtimeInput.
+              // Anteriormente enviado como array [{ mimeType, data }], o que gerava "realtimeInput": {}
+              await session.sendRealtimeInput({ 
+                  media: {
+                      mimeType: "audio/pcm;rate=16000", 
+                      data: base64Data
+                  }
+              });
           } catch (e: any) {
               if (e.message && (e.message.includes("CLOSING") || e.message.includes("CLOSED"))) return;
-              console.warn("Erro de envio:", e);
+              console.warn("Tx Error:", e);
           }
       }).catch(() => {});
   };
@@ -244,29 +246,29 @@ export const connectToLiveDebate = async (
 
     try {
         const sessionPromise = ai.live.connect({
-          model: LIVE_MODEL_NAME,
+          model: LIVE_MODEL_NAME, // Isso posiciona 'model' no setup, fora de 'config'
           config: {
-            // Configuração para Transcrição em Tempo Real (Texto Puro)
+            // Modality TEXT para stream contínuo sem esperar VAD
             responseModalities: [Modality.TEXT], 
             
-            // FIX CRÍTICO (Erro 1007): Objeto vazio para ativar transcrição.
-            // Não enviar 'model' aqui dentro.
+            // Ativa transcrição com objeto vazio (sem propriedade 'model' interna)
             // @ts-ignore
             inputAudioTranscription: { }, 
             
             systemInstruction: {
                 parts: [{ text: "You are a real-time transcriber. Transcribe the audio stream to Portuguese immediately as the words are spoken. Do not wait for complete sentences." }]
             },
-            
-            // speechConfig REMOVIDO para evitar incompatibilidade com Modality.TEXT
+            // speechConfig: REMOVIDO para evitar Erro 1007
           },
           callbacks: {
             onopen: () => {
-               console.log("🟢 Conectado (Stream Mode: TEXT)");
+               console.log("🟢 Conectado (Mode: TEXT, Transc: ON)");
                connectionState = 'CONNECTED';
                onStatus?.({ type: 'info', message: "ONLINE" });
             },
             onmessage: (msg: LiveServerMessage) => {
+               // A transcrição chega via inputTranscription (o que o usuário fala)
+               // ou modelTurn (o que o modelo responde, se configurado para responder)
                const inputTranscript = msg.serverContent?.inputTranscription?.text;
                const modelText = msg.serverContent?.modelTurn?.parts?.[0]?.text;
                
