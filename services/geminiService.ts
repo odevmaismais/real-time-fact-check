@@ -250,7 +250,7 @@ export const connectToLiveDebate = async (
               source.connect(processor);
               processor.connect(audioContext.destination); // Necessário para manter vivo no Chrome
           }
-
+ 
       } catch (err: any) {
           console.error("Falha na conexão:", err);
           if (shouldReconnect) setTimeout(connect, 1000);
