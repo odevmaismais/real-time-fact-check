@@ -218,7 +218,7 @@ export const connectToLiveDebate = async (
         console.warn("🔇 ALERTA: Buffer de áudio zerado (Silêncio Digital).");
       } else if (Math.random() > 0.95) { 
         // Log amostral para não spammar o console
-        console.debug(`🔊 Enviando audio... [RMS: ${Math.floor(rms)}]`);
+        console.debug(`🔊 Enviando audio... [Size: ${pcmInt16.length} samples] [RMS: ${Math.floor(rms)}]`);
       }
       // ---------------------------
 
@@ -248,30 +248,30 @@ export const connectToLiveDebate = async (
         const sessionPromise = ai.live.connect({
           model: LIVE_MODEL_NAME,
           config: {
-            responseModalities: [Modality.AUDIO], 
+            // FIX: Alterado para TEXT para permitir streaming contínuo sem esperar VAD
+            responseModalities: [Modality.TEXT], 
             
-            // Ativa transcrição (Necessário enviar objeto vazio)
+            // Ativa transcrição
             // @ts-ignore
-            inputAudioTranscription: { }, 
+            inputAudioTranscription: { model: LIVE_MODEL_NAME }, 
             
             systemInstruction: {
-                parts: [{ text: "You are a passive transcription system. Your ONLY job is to transcribe the input audio to Portuguese. Do NOT generate audio responses." }]
+                parts: [{ text: "You are a continuous audio transcriber. Transcribe the input audio to Portuguese in real-time. Do not wait for silence." }]
             },
-            speechConfig: {
-                voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
-            }
+            
+            // FIX CRÍTICO: speechConfig REMOVIDO pois é incompatível com Modality.TEXT
           },
           callbacks: {
             onopen: () => {
-               console.log("🟢 Conectado (Worklet Mode)");
+               console.log("🟢 Conectado (Stream Mode: TEXT)");
                connectionState = 'CONNECTED';
                onStatus?.({ type: 'info', message: "ONLINE" });
             },
             onmessage: (msg: LiveServerMessage) => {
-               // Captura transcrição do usuário
+               // Captura transcrição do usuário (Input do modelo)
                const inputTranscript = msg.serverContent?.inputTranscription?.text;
                
-               // Captura resposta do modelo (se houver, embora tenhamos pedido para não gerar)
+               // Captura resposta do modelo (Se ele decidir falar o texto)
                const modelText = msg.serverContent?.modelTurn?.parts?.[0]?.text;
                
                if (inputTranscript) handleText(inputTranscript);
