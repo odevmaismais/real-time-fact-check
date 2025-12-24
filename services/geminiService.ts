@@ -2,7 +2,7 @@ import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
 import { AnalysisResult, VerdictType } from "../types";
 
 const MODEL_NAME = "gemini-2.0-flash-exp";
-const LIVE_MODEL_NAME = "gemini-2.0-flash-exp";
+const LIVE_MODEL_NAME = "models/gemini-2.0-flash-exp";
 
 // --- TIPOS E ESTADOS ---
 
@@ -18,14 +18,15 @@ export interface LiveConnectionController {
 }
 
 // --- AUDIO WORKLET CODE (INLINE) ---
-// Versão SIMPLIFICADA e ROBUSTA (Stateless)
-// Focada em garantir que o áudio chegue sem falhas (evita o silêncio da interpolação complexa)
+// HÍBRIDO: Usa a sua lógica de 'Averaging' + 'Tanh Boost' para garantir volume,
+// mas estruturada para ser segura em threads.
 const PCM_PROCESSOR_CODE = `
 class PCMProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
     this.buffer = new Int16Array(4096); 
     this.bufferIndex = 0;
+    this.targetRate = 16000;
   }
 
   process(inputs, outputs, parameters) {
@@ -34,27 +35,44 @@ class PCMProcessor extends AudioWorkletProcessor {
     
     const inputChannel = input[0];
     const inputRate = sampleRate;
-    const targetRate = 16000;
-    const ratio = inputRate / targetRate;
+    const ratio = inputRate / this.targetRate;
     
-    // Cálculo seguro de quantas amostras gerar neste ciclo
-    const newSamples = Math.floor(inputChannel.length / ratio);
+    let inputIndex = 0;
     
-    for (let i = 0; i < newSamples; i++) {
-        const offset = Math.floor(i * ratio);
-        const val = inputChannel[offset];
-
-        // Processamento simples e seguro (Clamp + Conversão)
-        const s = Math.max(-1, Math.min(1, val));
-        const pcm = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    while (inputIndex < inputChannel.length) {
+        let sum = 0;
+        let count = 0;
         
-        // Flush do buffer se encher
+        // Downsampling com Média (Box Filter) - Preserva energia do sinal
+        const start = Math.floor(inputIndex);
+        const end = Math.min(inputChannel.length, Math.floor(inputIndex + ratio));
+        
+        for (let i = start; i < end; i++) {
+            sum += inputChannel[i];
+            count++;
+        }
+        
+        // Fallback para bordas
+        if (count === 0 && start < inputChannel.length) {
+            sum = inputChannel[start];
+            count = 1;
+        }
+
+        const avg = count > 0 ? sum / count : 0;
+        
+        // BOOST INTELIGENTE (Crucial para o Gemini ouvir)
+        // O tanh aumenta sinais baixos sem distorcer os altos
+        const boosted = Math.tanh(avg * 3.0); 
+        
+        const pcm = boosted < 0 ? boosted * 0x8000 : boosted * 0x7FFF;
+        
         if (this.bufferIndex >= this.buffer.length) {
             this.port.postMessage(this.buffer.slice(0, this.bufferIndex));
             this.bufferIndex = 0;
         }
         
         this.buffer[this.bufferIndex++] = pcm;
+        inputIndex += ratio;
     }
     return true;
   }
@@ -64,7 +82,7 @@ registerProcessor('pcm-processor', PCMProcessor);
 
 // --- UTILS ---
 
-// ATENÇÃO: Usar apenas para limpar o output FINAL, não durante a montagem do stream
+// ATENÇÃO: Só usamos para limpar o output FINAL, nunca o buffer intermediário
 const cleanTranscriptText = (text: string): string => {
   if (!text) return "";
   return text.replace(/\s+/g, ' ').trim();
@@ -173,11 +191,8 @@ export const connectToLiveDebate = async (
 
   const initAudioStack = async () => {
       try {
-          // Deixar o navegador usar a taxa nativa para evitar glitches
           audioContext = new AudioContext(); 
           if (audioContext.state === 'suspended') await audioContext.resume();
-
-          console.log(`🎤 Audio Context Rate: ${audioContext.sampleRate}Hz`);
 
           const blob = new Blob([PCM_PROCESSOR_CODE], { type: "application/javascript" });
           const workletUrl = URL.createObjectURL(blob);
@@ -196,7 +211,7 @@ export const connectToLiveDebate = async (
           sourceNode.connect(workletNode);
           workletNode.connect(audioContext.destination); 
           
-          console.log("🔊 Audio Worklet Initialized (Standard Mode)");
+          console.log("🔊 Audio Worklet Initialized (Box Filter + Boost)");
 
       } catch (e) {
           console.error("Falha ao iniciar Audio Engine", e);
@@ -212,7 +227,6 @@ export const connectToLiveDebate = async (
       activeSessionPromise.then(async (session) => {
           if (connectionState !== 'CONNECTED') return;
           try {
-              // Rate 16000 é mandatório para o Gemini Live
               await session.sendRealtimeInput([{ 
                   mimeType: "audio/pcm;rate=16000", 
                   data: base64Data
@@ -234,21 +248,16 @@ export const connectToLiveDebate = async (
         const sessionPromise = ai.live.connect({
           model: LIVE_MODEL_NAME,
           config: {
-            // TEXT: Garante stream em tempo real sem buffering
             responseModalities: [Modality.TEXT], 
-            
-            // Input Vazio: Schema correto para evitar erro 1007
             // @ts-ignore
             inputAudioTranscription: { }, 
-            
             systemInstruction: {
-                // Instrução equilibrada: pede tempo real mas com precisão
-                parts: [{ text: "You are a precise real-time transcriber. Transcribe the Portuguese audio stream exactly as spoken. Output words as soon as they are recognized." }]
+                parts: [{ text: "You are a precise real-time transcriber. Transcribe the Portuguese audio stream exactly as spoken. Output words as soon as they are recognized. Do not wait for punctuation." }]
             },
           },
           callbacks: {
             onopen: () => {
-               console.log("🟢 Conectado (Real-Time Text Mode)");
+               console.log("🟢 Conectado (Hybrid Mode)");
                connectionState = 'CONNECTED';
                onStatus?.({ type: 'info', message: "ONLINE" });
             },
@@ -293,22 +302,20 @@ export const connectToLiveDebate = async (
     }
   };
 
-  // Handlers de Texto
+  // --- O SEGREDO DO TEXTO FLUIDO ---
   let currentBuffer = "";
   const handleText = (raw: string) => {
-      // FIX CRÍTICO PARA O TEXTO "PICOTADO":
-      // Não fazemos trim() nem adicionamos espaço forçado.
-      // O Gemini envia " ca" (com espaço) ou "sa" (sem espaço) para completar a palavra.
-      // Respeitar o 'raw' resolve a quebra de palavras.
+      // NÃO FAZEMOS TRIM AQUI.
+      // O Gemini envia " pa" e depois "lavra". Se dermos trim, vira "pa" + "lavra" -> "palavra".
+      // Se ele enviar " palavra", o espaço inicial é preservado e separa da anterior.
       if (raw) {
-          console.log("📝 Chunk:", raw); 
           currentBuffer += raw; 
           
-          // Enviamos para a UI com um trim apenas na visualização, não no buffer interno
+          // Trim apenas visual para a UI, sem afetar a concatenação futura
           onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: false });
           
-          // Detecta final de frase para limpar buffer e enviar para análise
-          if (currentBuffer.length > 80 || raw.match(/[.!?]$/)) {
+          // Detecta fim de frase apenas para limpar o buffer de memória
+          if (currentBuffer.length > 150 || raw.match(/[.!?]$/)) {
               onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: true });
               currentBuffer = "";
           }
