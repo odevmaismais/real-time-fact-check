@@ -10,8 +10,20 @@ export enum VerdictType {
   TRUE = 'TRUE',
   FALSE = 'FALSE',
   MISLEADING = 'MISLEADING',
-  UNVERIFIABLE = 'UNVERIFIABLE',
-  OPINION = 'OPINION'
+  OPINION = 'OPINION',
+  UNVERIFIABLE = 'UNVERIFIABLE'
+}
+
+export interface AnalysisResult {
+  segmentId: string;
+  verdict: VerdictType;
+  confidence: number;
+  explanation: string;
+  counterEvidence?: string;
+  sources: string[];
+  sentimentScore: number;
+  logicalFallacies: string[];
+  context: string[];
 }
 
 export interface GroundingSource {
@@ -28,19 +40,6 @@ export interface TokenUsage {
 export interface LogicalFallacy {
   name: string;
   description: string;
-}
-
-export interface AnalysisResult {
-  segmentId: string;
-  verdict: VerdictType;
-  confidence: number;
-  explanation: string;
-  counterEvidence?: string;
-  sources: GroundingSource[];
-  sentimentScore: number; // -1 to 1
-  logicalFallacies?: LogicalFallacy[];
-  tokenUsage?: TokenUsage;
-  context?: string[]; // New: The historical context used for this analysis
 }
 
 export interface AppState {

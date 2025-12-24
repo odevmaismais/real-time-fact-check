@@ -1,49 +1,34 @@
-import { MongoClient, Db } from 'mongodb';
+import { MongoClient } from 'mongodb';
 
-const URI = process.env.MONGODB_URI || "mongodb+srv://Vercel-Admin-o-esgoto-do-poder:DKkQ7z6HcVxcOvHx@o-esgoto-do-poder.b82hdkf.mongodb.net/?retryWrites=true&w=majority";
-const DB_NAME = "dossie_oculto_logs";
+const uri = process.env.MONGODB_URI || "";
+const options = {};
 
-let cachedDb: Db | null = null;
+let client;
+let clientPromise: Promise<MongoClient>;
 
-// Extensão do objeto global para cache em desenvolvimento (HMR)
-let globalWithMongo = globalThis as typeof globalThis & {
-  _mongoDb?: Db;
-};
+if (!process.env.MONGODB_URI) {
+  throw new Error('Please add your Mongo URI to .env.local');
+}
 
-export const connectToDb = async (): Promise<Db> => {
-  if (cachedDb) {
-    return cachedDb;
+if (process.env.NODE_ENV === 'development') {
+  // Em desenvolvimento, use uma variável global para preservar o cliente
+  // entre reloads de módulo causados pelo HMR.
+  if (!(global as any)._mongoClientPromise) {
+    client = new MongoClient(uri, options);
+    (global as any)._mongoClientPromise = client.connect();
   }
+  clientPromise = (global as any)._mongoClientPromise;
+} else {
+  // Em produção, é seguro não usar variável global.
+  client = new MongoClient(uri, options);
+  clientPromise = client.connect();
+}
 
-  if (globalWithMongo._mongoDb) {
-    cachedDb = globalWithMongo._mongoDb;
-    return cachedDb;
-  }
+// Função helper para conectar ao banco
+export async function connectToDb() {
+    const client = await clientPromise;
+    const db = client.db('fact-check-db'); // Nome do seu banco
+    return { client, db };
+}
 
-  try {
-    const client = new MongoClient(URI);
-    await client.connect();
-    
-    const db = client.db(DB_NAME);
-    
-    cachedDb = db;
-    globalWithMongo._mongoDb = db;
-    
-    console.log("🟢 Connected to MongoDB Atlas (Serverless)");
-    return db;
-  } catch (error) {
-    console.error("🔴 MongoDB Connection Error:", error);
-    throw error;
-  }
-};
-
-export const getDb = (): Db => {
-  if (cachedDb) {
-    return cachedDb;
-  }
-  if (globalWithMongo._mongoDb) {
-    cachedDb = globalWithMongo._mongoDb;
-    return cachedDb;
-  }
-  throw new Error("Database not initialized. Call connectToDb first.");
-};
+export default clientPromise;

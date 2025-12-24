@@ -1,4 +1,4 @@
-import { GoogleGenAI, LiveServerMessage, Modality, SchemaType } from "@google/genai";
+import { GoogleGenAI, LiveServerMessage, Modality, FunctionDeclaration, SchemaType } from "@google/genai";
 import { AnalysisResult, VerdictType } from "../types";
 
 const MODEL_NAME = "gemini-2.0-flash-exp";
@@ -111,7 +111,7 @@ export const analyzeStatement = async (
 };
 
 // -------------------------------------------
-// CONEXÃO LIVE (STREAMING COM AUTO-RECONEXÃO)
+// CONEXÃO LIVE (PERSISTENT TOOL STREAM)
 // -------------------------------------------
 
 export interface LiveConnectionController {
@@ -131,135 +131,194 @@ export const connectToLiveDebate = async (
     return { disconnect: async () => {}, flush: () => {} };
   }
 
+  // [CORREÇÃO CRÍTICA] Clona o stream para uso exclusivo do Gemini
   const stream = originalStream.clone();
   
-  let shouldReconnect = true;
-  let activeSession: any = null;
+  let shouldMaintainConnection = true;
+  let activeSessionPromise: Promise<any> | null = null;
   let audioContext: AudioContext | null = null;
   let source: MediaStreamAudioSourceNode | null = null;
   let processor: ScriptProcessorNode | null = null;
+  let reconnectCount = 0;
   let currentBuffer = "";
 
   const ai = new GoogleGenAI({ apiKey });
 
-  const handleTranscriptText = (text: string) => {
-      const clean = cleanTranscriptText(text);
-      if (clean) {
-          console.log("📝 TRANSCRITO:", clean);
-          currentBuffer += " " + clean;
+  // 1. TOOL DEFINITION (Corrigido com SchemaType)
+  const transcriptTool: FunctionDeclaration = {
+      name: "submit_transcript",
+      description: "Submits the raw text transcription of the Portuguese speech detected.",
+      parameters: {
+          type: SchemaType.OBJECT,
+          properties: {
+              text: {
+                  type: SchemaType.STRING,
+                  description: "The transcribed text."
+              }
+          },
+          required: ["text"]
+      }
+  };
+
+  const handleText = (raw: string) => {
+      const text = cleanTranscriptText(raw);
+      if (text.length > 0) {
+          console.log("📝 TRANSCRITO:", text);
+          currentBuffer += " " + text;
           onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: false });
-          if (currentBuffer.length > 100 || clean.match(/[.!?]$/)) {
+          
+          if (currentBuffer.length > 80 || text.match(/[.!?]$/)) {
               onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: true });
               currentBuffer = "";
           }
       }
   };
 
-  const connect = async () => {
-      try {
-          if (!audioContext || audioContext.state === 'closed') {
-              audioContext = new AudioContext();
+  const establishConnection = () => {
+    if (!shouldMaintainConnection) return;
+
+    console.log(`📡 Estabelecendo conexão... (Tentativa ${reconnectCount + 1})`);
+    onStatus?.({ type: 'info', message: reconnectCount > 0 ? "RECONECTANDO..." : "CONECTANDO..." });
+
+    try {
+        let sessionPromise: Promise<any>;
+
+        sessionPromise = ai.live.connect({
+          model: LIVE_MODEL_NAME,
+          config: {
+            responseModalities: [Modality.AUDIO],
+            // @ts-ignore
+            inputAudioTranscription: {}, 
+            speechConfig: {
+                voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
+            },
+            systemInstruction: {
+                parts: [{ text: "You are a specialized audio transcriber. Listen continuously. Whenever you hear speech in Portuguese, IMMEDIATELY call the `submit_transcript` function with the text. Do NOT speak. Do NOT reply with audio. Do NOT summarize." }]
+            },
+            tools: [{ functionDeclarations: [transcriptTool] }],
+          },
+          callbacks: {
+            onopen: () => {
+               console.log("🟢 Conectado!");
+               onStatus?.({ type: 'info', message: "ESCUTANDO" });
+               reconnectCount = 0;
+            },
+            onmessage: (msg: LiveServerMessage) => {
+               const parts = msg.serverContent?.modelTurn?.parts;
+               if (parts) {
+                   for (const part of parts) {
+                       if (part.functionCall) {
+                           const fc = part.functionCall;
+                           if (fc.name === 'submit_transcript') {
+                               const args = fc.args as any;
+                               if (args && args.text) handleText(args.text);
+
+                               // Confirma recebimento para manter o fluxo
+                               sessionPromise.then(async (session) => {
+                                    await session.sendToolResponse({
+                                        functionResponses: [{
+                                            id: fc.id,
+                                            name: fc.name,
+                                            response: { result: "ok" }
+                                        }]
+                                    });
+                               }).catch(() => {});
+                           }
+                       }
+                   }
+               }
+            },
+            onclose: (e) => {
+               console.log("⚠️ Conexão fechada:", e);
+               if (shouldMaintainConnection) {
+                   reconnectCount++;
+                   setTimeout(establishConnection, 100); 
+               } else {
+                   onStatus?.({ type: 'warning', message: "DESCONECTADO" });
+               }
+            },
+            onerror: (err) => console.error("🔴 Erro de Socket:", err)
           }
-          if (audioContext.state === 'suspended') await audioContext.resume();
+        });
 
-          const streamRate = audioContext.sampleRate;
-          console.log(`🔄 (Re)Conectando Gemini... Rate: ${streamRate}`);
+        activeSessionPromise = sessionPromise;
 
-          activeSession = await ai.live.connect({
-              model: LIVE_MODEL_NAME,
-              config: {
-                  responseModalities: [Modality.AUDIO], 
-                  // @ts-ignore
-                  inputAudioTranscription: {}, 
-                  tools: [{
-                      functionDeclarations: [{
-                          name: "submit_transcript",
-                          description: "Submit the transcribed text from the audio stream.",
-                          parameters: {
-                              // CORREÇÃO AQUI: Usando SchemaType
-                              type: SchemaType.OBJECT,
-                              properties: {
-                                  text: { type: SchemaType.STRING, description: "The transcribed text in Portuguese." }
-                              },
-                              required: ["text"]
-                          }
-                      }]
-                  }],
-                  systemInstruction: {
-                      parts: [{ text: "You are a transcriber. Listen to the audio. Whenever you detect speech, IMMEDIATELY call the function 'submit_transcript' with the exact Portuguese text. Do NOT speak. Do NOT reply with audio." }]
-                  }
-              },
-              callbacks: {
-                  onopen: () => onStatus?.({ type: 'info', message: "CONECTADO (AUTO-REC)" }),
-                  onmessage: (msg: LiveServerMessage) => {
-                      const fc = msg.serverContent?.modelTurn?.parts?.find(p => p.functionCall);
-                      if (fc && fc.functionCall?.name === 'submit_transcript') {
-                          const args = fc.functionCall.args as any;
-                          if (args?.text) handleTranscriptText(args.text);
-                      }
-                      
-                      const t1 = msg.serverContent?.inputTranscription?.text;
-                      if (t1) handleTranscriptText(t1);
-                  },
-                  onclose: (e) => {
-                      console.log("⚠️ Conexão fechada:", e);
-                      if (shouldReconnect) {
-                          onStatus?.({ type: 'warning', message: "RECONECTANDO..." });
-                          setTimeout(connect, 100); 
-                      }
-                  },
-                  onerror: (e) => console.error("Erro stream:", e)
-              }
-          });
+        sessionPromise.catch(err => {
+            console.error("Erro Promise:", err);
+            if (shouldMaintainConnection) setTimeout(establishConnection, 1000); 
+        });
 
-          if (!processor) {
-              source = audioContext.createMediaStreamSource(stream);
-              processor = audioContext.createScriptProcessor(4096, 1, 1);
-              
-              processor.onaudioprocess = async (e) => {
-                  if (!shouldReconnect || !activeSession) return;
-
-                  const inputData = e.inputBuffer.getChannelData(0);
-                  
-                  if (Math.random() < 0.05) console.log("💓 Audio Pulse (Processing)");
-
-                  const boosted = new Float32Array(inputData.length);
-                  for (let i = 0; i < inputData.length; i++) boosted[i] = inputData[i] * 5.0;
-
-                  try {
-                      const pcm16k = downsampleTo16k(boosted, streamRate);
-                      const base64Data = arrayBufferToBase64(pcm16k.buffer as ArrayBuffer);
-                      
-                      await activeSession.sendRealtimeInput([{ 
-                          mimeType: "audio/pcm;rate=16000",
-                          data: base64Data
-                      }]);
-                  } catch (err) {
-                  }
-              };
-
-              source.connect(processor);
-              processor.connect(audioContext.destination); 
-          }
- 
-      } catch (err: any) {
-          console.error("Falha na conexão:", err);
-          if (shouldReconnect) setTimeout(connect, 1000);
-      }
+    } catch (err) {
+        console.error("Erro Geral:", err);
+        if (shouldMaintainConnection) setTimeout(establishConnection, 1000);
+    }
   };
 
-  connect();
+  establishConnection();
+
+  // 3. PROCESSAMENTO DE ÁUDIO
+  const initAudio = async () => {
+      audioContext = new AudioContext();
+      if (audioContext.state === 'suspended') await audioContext.resume();
+      
+      const streamRate = audioContext.sampleRate;
+      source = audioContext.createMediaStreamSource(stream);
+      processor = audioContext.createScriptProcessor(4096, 1, 1);
+      gain = audioContext.createGain();
+      gain.gain.value = 0;
+
+      processor.onaudioprocess = async (e) => {
+          if (!activeSessionPromise) return;
+
+          const inputData = e.inputBuffer.getChannelData(0);
+          
+          if (Math.random() < 0.05) console.log("💓 Audio Pulse");
+
+          let vol = 0;
+          const boosted = new Float32Array(inputData.length);
+          for (let i = 0; i < inputData.length; i++) {
+              boosted[i] = inputData[i] * 5.0; // Boost 5x
+              vol += Math.abs(inputData[i]);
+          }
+
+          if (vol < 0.0001) return;
+
+          try {
+              const pcm16k = downsampleTo16k(boosted, streamRate);
+              const base64Data = arrayBufferToBase64(pcm16k.buffer as ArrayBuffer);
+
+              activeSessionPromise.then(async (session) => {
+                 await session.sendRealtimeInput([{ 
+                      mimeType: "audio/pcm;rate=16000",
+                      data: base64Data
+                  }]);
+              }).catch(() => {});
+          } catch (err) {}
+      };
+
+      source.connect(processor);
+      processor.connect(gain);
+      gain.connect(audioContext.destination);
+  };
+
+  initAudio();
 
   return {
-      disconnect: async () => {
-          shouldReconnect = false;
-          console.log("🛑 Parando tudo...");
-          if (activeSession) await activeSession.close();
-          if (source) source.disconnect();
-          if (processor) processor.disconnect();
-          if (audioContext) await audioContext.close();
-          stream.getTracks().forEach(t => t.stop()); 
-      },
-      flush: () => { currentBuffer = ""; }
-  };
+       disconnect: async () => {
+           console.log("🛑 Encerrando...");
+           shouldMaintainConnection = false;
+           if (source) source.disconnect();
+           if (processor) processor.disconnect();
+           if (gain) gain.disconnect();
+           if (activeSessionPromise) {
+               try {
+                   const session = await activeSessionPromise;
+                   session.close();
+               } catch (e) { /* ignore */ }
+           }
+           if (audioContext && audioContext.state !== 'closed') await audioContext.close();
+           stream.getTracks().forEach(t => t.stop()); 
+       },
+       flush: () => { currentBuffer = ""; }
+    };
 }
