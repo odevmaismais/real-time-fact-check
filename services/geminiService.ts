@@ -2,22 +2,26 @@ import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
 import { AnalysisResult, VerdictType } from "../types";
 
 const MODEL_NAME = "gemini-2.0-flash-exp";
-// Prefixo 'models/' é obrigatório para garantir a rota correta
+// Prefixo 'models/' é necessário para estabilidade da rota
 const LIVE_MODEL_NAME = "models/gemini-2.0-flash-exp";
 
-// --- TIPOS ---
+// --- TIPOS E ESTADOS ---
+
 export type LiveStatus = {
   type: 'info' | 'warning' | 'error';
   message: string;
 };
 
+type ConnectionState = 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED' | 'RECONNECTING';
+
 export interface LiveConnectionController {
     disconnect: () => Promise<void>;
 }
 
-// --- AUDIO WORKLET (HIGH FIDELITY - NO BOOST) ---
-// Removemos todos os ganhos e compressores.
-// Fazemos apenas o 'Box Filter' (média) para converter 48k -> 16k mantendo a qualidade original.
+// --- AUDIO WORKLET CODE (INLINE) ---
+// PROCESSADOR PURO (SEM BOOST)
+// Removemos qualquer ganho artificial. O sinal passa original.
+// Usamos 'Box Filter' (média) apenas para converter a taxa de 48k para 16k com qualidade.
 const PCM_PROCESSOR_CODE = `
 class PCMProcessor extends AudioWorkletProcessor {
   constructor() {
@@ -39,7 +43,7 @@ class PCMProcessor extends AudioWorkletProcessor {
         let sum = 0;
         let count = 0;
         
-        // Média das amostras (Box Filter) para evitar aliasing
+        // Downsampling por Média (Evita aliasing e preserva frequências)
         const start = Math.floor(inputIndex);
         const end = Math.min(inputChannel.length, Math.floor(inputIndex + ratio));
         
@@ -48,16 +52,14 @@ class PCMProcessor extends AudioWorkletProcessor {
             count++;
         }
         
-        // Fallback para bordas do buffer
         if (count === 0 && start < inputChannel.length) {
             sum = inputChannel[start];
             count = 1;
         }
 
-        // Média Pura (Volume Original)
         const avg = count > 0 ? sum / count : 0;
         
-        // Apenas Clamp de segurança (-1 a 1) sem amplificação
+        // SEM BOOST: Apenas clamp de segurança (-1 a 1)
         const s = Math.max(-1, Math.min(1, avg));
         
         // Conversão PCM 16-bit
@@ -94,7 +96,7 @@ function arrayBufferToBase64(buffer: ArrayBuffer | SharedArrayBuffer): string {
     return window.btoa(binary);
 }
 
-// --- FACT CHECKING (COM PARSER SEGURO) ---
+// --- FACT CHECKING (COM CORREÇÃO DE SYNTAX ERROR) ---
 export const analyzeStatement = async (
   text: string,
   segmentId: string,
@@ -122,7 +124,7 @@ export const analyzeStatement = async (
       },
     });
 
-    // Sanitização de Markdown para evitar SyntaxError no JSON
+    // Sanitização de Markdown para evitar SyntaxError no JSON.parse
     let jsonText = response.text || "{}";
     jsonText = jsonText.replace(/```json/g, "").replace(/```/g, "").trim();
 
@@ -179,7 +181,7 @@ export const connectToLiveDebate = async (
   const stream = originalStream.clone();
   const ai = new GoogleGenAI({ apiKey });
 
-  let connectionState: 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED' | 'RECONNECTING' = 'DISCONNECTED';
+  let connectionState: ConnectionState = 'DISCONNECTED';
   let shouldMaintainConnection = true;
   
   let activeSessionPromise: Promise<any> | null = null;
@@ -193,7 +195,7 @@ export const connectToLiveDebate = async (
           audioContext = new AudioContext(); 
           if (audioContext.state === 'suspended') await audioContext.resume();
 
-          console.log(`🔊 AudioContext: ${audioContext.sampleRate}Hz`);
+          console.log(`🔊 AudioContext: ${audioContext.sampleRate}Hz (Natural)`);
 
           const blob = new Blob([PCM_PROCESSOR_CODE], { type: "application/javascript" });
           const workletUrl = URL.createObjectURL(blob);
@@ -211,7 +213,8 @@ export const connectToLiveDebate = async (
 
           sourceNode.connect(workletNode);
           workletNode.connect(audioContext.destination); 
-          console.log("🔊 Worklet Iniciado");
+          
+          console.log("🔊 Worklet Pronto");
 
       } catch (e) {
           console.error("Audio Init Error:", e);
@@ -249,7 +252,6 @@ export const connectToLiveDebate = async (
           model: LIVE_MODEL_NAME, 
           config: {
             responseModalities: [Modality.TEXT], 
-            // Configuração correta para ativar transcrição sem erro 1007
             // @ts-ignore
             inputAudioTranscription: { }, 
             systemInstruction: {
@@ -305,14 +307,14 @@ export const connectToLiveDebate = async (
     }
   };
 
-  // --- LÓGICA DE TEXTO (Sem picotar) ---
   let currentBuffer = "";
   const handleText = (raw: string) => {
-      // Recebe o texto BRUTO para preservar espaços e colar palavras.
+      // FIX PICOTADO: Recebe texto bruto, preserva espaços iniciais (ex: " palavra")
       if (raw) {
+          console.log("📝", `"${raw}"`); 
           currentBuffer += raw; 
           
-          // Envia para UI com trim VISUAL
+          // Trim apenas para a UI
           onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: false });
           
           // Limpa buffer em frases completas
