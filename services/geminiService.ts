@@ -2,11 +2,10 @@ import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
 import { AnalysisResult, VerdictType } from "../types";
 
 const MODEL_NAME = "gemini-2.0-flash-exp";
-// CORREÇÃO: Prefixo 'models/' explícito conforme solicitado pelo log de rede esperado
 const LIVE_MODEL_NAME = "models/gemini-2.0-flash-exp";
 
 // --- TIPOS E ESTADOS ---
- 
+
 export type LiveStatus = {
   type: 'info' | 'warning' | 'error';
   message: string;
@@ -19,8 +18,8 @@ export interface LiveConnectionController {
 }
 
 // --- AUDIO WORKLET CODE (INLINE) ---
-// Processamento seguro em Thread separada
-// MELHORIA: Downsampling com média (Box Filter) e Soft Limiter (tanh) para clareza vocal.
+// Mantido o seu código original que FUNCIONA (Box Filter + Tanh Boost)
+// Isso garante volume suficiente para o VAD do Gemini ativar.
 const PCM_PROCESSOR_CODE = `
 class PCMProcessor extends AudioWorkletProcessor {
   constructor() {
@@ -35,7 +34,6 @@ class PCMProcessor extends AudioWorkletProcessor {
     if (!input || !input[0]) return true;
     
     const inputChannel = input[0];
-    // sampleRate é global no AudioWorkletScope
     const ratio = sampleRate / this.targetRate;
     
     let inputIndex = 0;
@@ -44,8 +42,6 @@ class PCMProcessor extends AudioWorkletProcessor {
         let sum = 0;
         let count = 0;
         
-        // Downsampling com Média (Anti-Aliasing simples)
-        // Em vez de pular amostras, tiramos a média do intervalo.
         const start = Math.floor(inputIndex);
         const end = Math.min(inputChannel.length, Math.floor(inputIndex + ratio));
         
@@ -54,7 +50,6 @@ class PCMProcessor extends AudioWorkletProcessor {
             count++;
         }
         
-        // Fallback para evitar divisão por zero em casos de borda
         if (count === 0 && start < inputChannel.length) {
             sum = inputChannel[start];
             count = 1;
@@ -62,23 +57,17 @@ class PCMProcessor extends AudioWorkletProcessor {
 
         const avg = count > 0 ? sum / count : 0;
         
-        // SMART GAIN + SOFT LIMITER
-        // Math.tanh atua como um compressor natural:
-        // - Aumenta sinais baixos (linear perto de 0)
-        // - Suaviza sinais altos sem cortar (clipping digital duro)
-        // Ganho de 2.5x é suficiente para captar vozes normais sem distorção.
+        // BOOST: Essencial para o Gemini ouvir o áudio
         const boosted = Math.tanh(avg * 2.5); 
         
-        // Conversão Float (-1.0 a 1.0) -> Int16
         const pcm = boosted < 0 ? boosted * 0x8000 : boosted * 0x7FFF;
         
         if (this.bufferIndex >= this.buffer.length) {
-           this.port.postMessage(this.buffer.slice(0, this.bufferIndex));
-           this.bufferIndex = 0;
+            this.port.postMessage(this.buffer.slice(0, this.bufferIndex));
+            this.bufferIndex = 0;
         }
         
         this.buffer[this.bufferIndex++] = pcm;
-        
         inputIndex += ratio;
     }
     return true;
@@ -89,6 +78,8 @@ registerProcessor('pcm-processor', PCMProcessor);
 
 // --- UTILS ---
 
+// ATENÇÃO: Esta função remove espaços extras. Só deve ser usada na exibição final,
+// nunca na concatenação do buffer de stream.
 const cleanTranscriptText = (text: string): string => {
   if (!text) return "";
   return text.replace(/\s+/g, ' ').trim();
@@ -230,19 +221,6 @@ export const connectToLiveDebate = async (
   const sendAudioChunk = (pcmInt16: Int16Array) => {
       if (connectionState !== 'CONNECTED' || !activeSessionPromise) return;
 
-      // Telemetria
-      let sumSq = 0;
-      for (let i = 0; i < pcmInt16.length; i++) {
-        sumSq += pcmInt16[i] * pcmInt16[i];
-      }
-      const rms = Math.sqrt(sumSq / pcmInt16.length);
-
-      if (rms === 0) {
-        // Silence
-      } else if (Math.random() > 0.98) { 
-        console.debug(`🔊 Tx Chunk | RMS: ${Math.floor(rms)}`);
-      }
-
       const base64Data = arrayBufferToBase64(pcmInt16.buffer);
 
       activeSessionPromise.then(async (session) => {
@@ -272,16 +250,13 @@ export const connectToLiveDebate = async (
         const sessionPromise = ai.live.connect({
           model: LIVE_MODEL_NAME, 
           config: {
-            // Modality TEXT para stream contínuo
             responseModalities: [Modality.TEXT], 
             
-            // Ativa transcrição (objeto vazio)
             // @ts-ignore
             inputAudioTranscription: { }, 
             
-            // System Instruction Refinada e Concisa para Transcrição Verbatim
             systemInstruction: {
-                parts: [{ text: "Transcreva o áudio para Português do Brasil (PT-BR) imediatamente. Transcrição verbatim: palavra por palavra. Não resuma. Não responda a perguntas. Não use formatação de roteiro. Apenas o texto falado." }]
+                parts: [{ text: "Transcreva o áudio para Português do Brasil (PT-BR) imediatamente. Transcrição verbatim: palavra por palavra." }]
             },
           },
           callbacks: {
@@ -291,8 +266,6 @@ export const connectToLiveDebate = async (
                onStatus?.({ type: 'info', message: "ONLINE" });
             },
             onmessage: (msg: LiveServerMessage) => {
-               // A transcrição chega via inputTranscription (o que o usuário fala)
-               // ou modelTurn (o que o modelo responde, se configurado para responder)
                const inputTranscript = msg.serverContent?.inputTranscription?.text;
                const modelText = msg.serverContent?.modelTurn?.parts?.[0]?.text;
                
@@ -335,15 +308,24 @@ export const connectToLiveDebate = async (
     }
   };
 
-  // Handlers de Texto
+  // --- CORREÇÃO DO PICOTADO (TEXT HANDLING) ---
   let currentBuffer = "";
+  
   const handleText = (raw: string) => {
-      const text = cleanTranscriptText(raw);
-      if (text.length > 0) {
-          currentBuffer += " " + text;
+      // 1. NÃO usamos cleanTranscriptText(raw) aqui.
+      // O Gemini envia pedaços como " ca" (com espaço) ou "sa" (sem espaço) que colam perfeitamente.
+      // Se limparmos antes, perdemos a cola.
+      
+      if (raw) {
+          console.log("📝 Chunk Puro:", `"${raw}"`); // Debug para ver os espaços
+          currentBuffer += raw; 
+          
+          // 2. Enviamos para UI com trim() apenas visual
+          // O `onTranscript` da UI pode fazer o que quiser, mas o `currentBuffer` mantém a integridade
           onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: false });
           
-          if (currentBuffer.length > 80 || text.match(/[.!?]$/)) {
+          // 3. Detecção de fim de frase
+          if (currentBuffer.length > 150 || raw.match(/[.!?]$/)) {
               onTranscript({ text: currentBuffer.trim(), speaker: "DEBATE", isFinal: true });
               currentBuffer = "";
           }
